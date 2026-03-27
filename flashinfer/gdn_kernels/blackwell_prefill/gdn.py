@@ -4576,7 +4576,7 @@ class GDN:
         initial_state_f32_iter: Optional[cute.Pointer],
         state_output: Optional[cute.Pointer],
         scale: Optional[float],
-        cum_seqlen_q: Optional[cute.Tensor] = None,
+        cum_seqlen_q_ptr: Optional[cute.Pointer] = None,
         workspace_state_ptr: Optional[cute.Pointer] = None,
         workspace_flags_ptr: Optional[cute.Pointer] = None,
         stream: cuda.CUstream = None,
@@ -4584,6 +4584,15 @@ class GDN:
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
 
         b, s_q, s_sum, h_q, h_v, d = problem_size
+
+        # Reconstruct cum_seqlen_q tensor from pointer + batch_size.
+        # Using Pointer (not Tensor) avoids CuTe DSL baking the shape into
+        # the compiled kernel, so the same kernel handles any batch_size.
+        cum_seqlen_q = None
+        if cutlass.const_expr(cum_seqlen_q_ptr is not None):
+            cum_seqlen_q = cute.make_tensor(
+                cum_seqlen_q_ptr, cute.make_layout((b + 1,))
+            )
 
         h_r = h_v // h_q
         o_offset = 0 if cum_seqlen_q is None else (-s_q * d * h_r * h_q)
@@ -5386,8 +5395,12 @@ def chunk_gated_delta_rule(
     # Seq-dimension parallelism: split chunks across multiple CTAs per head.
     # num_chunk_groups > 1 when SM utilization is low.
     num_ctas_base = num_o_heads * num_seqs_local
-    if num_ctas_base < sm_count and cu_seqlens is None:
-        total_chunks = q.shape[1] // chunk_size
+    # Enable seq-dim parallelism when SM utilization is low.
+    # Works for both padded (cu_seqlens=None) and varlen single-seq (num_seqs=1).
+    can_parallel = (cu_seqlens is None) or (num_seqs_local == 1)
+    if num_ctas_base < sm_count and can_parallel:
+        max_s_q = problem_size[1]
+        total_chunks = max_s_q // chunk_size
         # Target: enough groups to fill ~80% of SMs
         target_ctas = max(sm_count * 3 // 4, num_ctas_base)
         num_chunk_groups = min(
@@ -5401,8 +5414,11 @@ def chunk_gated_delta_rule(
     # For seq-dim parallelism, always use initial_state and output_state
     cache_is_initial = is_initial_state or num_chunk_groups > 1
     cache_output_state = output_final_state or num_chunk_groups > 1
+    # Cache key: only compile-time invariants. problem_size[0:3] (b, s_q, s_sum)
+    # vary at runtime and are handled via Pointer + make_tensor inside the kernel.
+    h_q, h_v, d_val = problem_size[3], problem_size[4], problem_size[5]
     cache_key = (
-        problem_size,
+        (h_q, h_v, d_val),
         q.dtype,
         is_varlen,
         cache_is_initial,
@@ -5497,7 +5513,7 @@ def chunk_gated_delta_rule(
             state_tensor.iterator if state_tensor is not None else None,
             state_output_tensor.iterator if output_final_state else None,
             scale,
-            cu_seqlens_tensor,
+            cu_seqlens_tensor.iterator if cu_seqlens_tensor is not None else None,
             ws_state_tensor.iterator if ws_state_tensor is not None else None,
             ws_flags_tensor.iterator if ws_flags_tensor is not None else None,
             stream=current_stream,
@@ -5518,7 +5534,7 @@ def chunk_gated_delta_rule(
         initial_state.data_ptr() if initial_state is not None else None,
         output_state.data_ptr() if output_final_state else None,
         scale,
-        cu_seqlens,
+        from_dlpack(cu_seqlens, assumed_align=16, enable_tvm_ffi=True).iterator if cu_seqlens is not None else None,
         workspace_state.data_ptr() if workspace_state is not None else None,
         workspace_flags.data_ptr() if workspace_flags is not None else None,
         stream=current_stream,
