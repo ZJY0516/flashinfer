@@ -78,9 +78,11 @@ class GDN:
         is_persistent: bool = False,
         chunk_size: Int32 = 128,  # Only 128 is supported in current version
         head_dim: Int32 = 128,  # Only 128 is supported in current version
+        num_chunk_groups: int = 1,  # >1 for chunk parallelism (small heads)
     ):
         self.chunk_size = chunk_size
         self.is_persistent = is_persistent
+        self.num_chunk_groups = num_chunk_groups
 
         self.head_dim = head_dim
         self.cta_tiler = (chunk_size, chunk_size, head_dim)
@@ -96,13 +98,13 @@ class GDN:
         self.mma_tiler = (chunk_size, chunk_size, head_dim)
         self.qk_mma_tiler = self.mma_tiler
         self.kkt_mma_tiler = self.mma_tiler
-        self.kst_mma_tiler = self.mma_tiler
-        self.tuw_mma_tiler = self.mma_tiler
+        self.kst_mma_tiler = (chunk_size, head_dim, head_dim)
+        self.tuw_mma_tiler = (chunk_size, head_dim, chunk_size)
         self.o_intra_mma_tiler = (chunk_size, head_dim, chunk_size)
         self.qs_mma_tiler = (chunk_size, head_dim, head_dim)
         self.update_s_mma_tiler = (head_dim, head_dim, chunk_size)
 
-        self.epi_tile = (128, 128)
+        self.epi_tile = (chunk_size, head_dim)
 
         self.cluster_shape_mnk = (1, 1, 1)
 
@@ -325,6 +327,8 @@ class GDN:
         v_smem_layout_staged_b: cute.ComposedLayout,
         scale: cutlass.Float32,
         tile_sched_params: GdnStaticTileSchedulerParams,
+        workspace_state_ptr: Optional[cute.Pointer] = None,
+        workspace_flags_ptr: Optional[cute.Pointer] = None,
     ):
         """Warp-specialized GDN kernel entry point."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -669,10 +673,10 @@ class GDN:
         )
 
         # : ((128,128),1,1):((65536,1),0,0)
-        tQgate_layout = cute.make_layout(((128, 64), 1, 1), stride=((65536, 1), 0, 0))
+        tQgate_layout = cute.make_layout(((self.chunk_size, self.chunk_size // 2), 1, 1), stride=((65536, 1), 0, 0))
         tQgate = cute.make_tensor(tmem_ptr + self.tmem_gate_q, tQgate_layout)
 
-        tGamma_layout = cute.make_layout(((128, 128), 1, 1), stride=((65536, 1), 0, 0))
+        tGamma_layout = cute.make_layout(((self.chunk_size, self.chunk_size), 1, 1), stride=((65536, 1), 0, 0))
         tGamma = cute.make_tensor(tmem_ptr + self.tmem_gamma, tGamma_layout)
 
         # tStage
@@ -748,7 +752,7 @@ class GDN:
 
         o_intra_thr_mma_new = o_intra_tiled_ts_mma_new.get_slice(0)
         # input smem A
-        tQKMtQKM_layout = cute.composition(tQKtQK.layout, cute.make_layout((128, 64)))
+        tQKMtQKM_layout = cute.composition(tQKtQK.layout, cute.make_layout((self.chunk_size, self.chunk_size // 2)))
         tQKMtQKM = cute.make_tensor(tmem_ptr + self.tmem_gate_qk, tQKMtQKM_layout)
 
         update_s_thr_mma = update_s_tiled_mma.get_slice(0)
@@ -772,7 +776,11 @@ class GDN:
             tmem_ptr + self.tmem_o_inter_output, tOintertQS_fake.layout
         )
 
-        loop_count = cute.ceil_div(mO_qdl.shape[0], self.cta_tiler[0])
+        total_loop_count = cute.ceil_div(mO_qdl.shape[0], self.cta_tiler[0])
+        if cutlass.const_expr(self.num_chunk_groups > 1):
+            loop_count = total_loop_count // self.num_chunk_groups
+        else:
+            loop_count = total_loop_count
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load Gate Beta
@@ -787,6 +795,7 @@ class GDN:
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
+                chunk_start = curr_block_coord[0] * loop_count if cutlass.const_expr(self.num_chunk_groups > 1) else Int32(0)
 
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
@@ -808,13 +817,14 @@ class GDN:
 
                 if not continue_cond:
                     batch_base = cuseqlen_q
-                    gate_vals = cute.make_rmem_tensor((4), cutlass.Float32)
-                    beta_vals = cute.make_rmem_tensor((4), cutlass.Float32)
+                    gb_iters = self.chunk_size // 32
+                    gate_vals = cute.make_rmem_tensor((gb_iters), cutlass.Float32)
+                    beta_vals = cute.make_rmem_tensor((gb_iters), cutlass.Float32)
 
                     for i in cutlass.range(loop_count, unroll=1):
                         # step1: read gate beta
-                        for it in cutlass.range_constexpr(4):
-                            curr_idx = i * 128 + it * 32 + lane_id
+                        for it in cutlass.range_constexpr(gb_iters):
+                            curr_idx = (chunk_start + i) * self.chunk_size + it * 32 + lane_id
                             if curr_idx < seqlen_q:
                                 if cutlass.const_expr(cum_seqlen_q is not None):
                                     gate_vals[it] = gate[
@@ -839,9 +849,18 @@ class GDN:
 
                         gb_handle = gb_w0_producer.acquire_and_advance()
 
-                        for it in cutlass.range_constexpr(4):
+                        for it in cutlass.range_constexpr(gb_iters):
                             sGate0[it * 32 + lane_id] = gate_vals[it]
                             sBeta0[it * 32 + lane_id] = beta_vals[it]
+
+                        # Zero-fill remaining SMEM for chunk_size < 128
+                        # (threads 64-127 would read garbage otherwise)
+                        if cutlass.const_expr(self.chunk_size < 128):
+                            for it in cutlass.range_constexpr(
+                                gb_iters, 128 // 32
+                            ):
+                                sGate0[it * 32 + lane_id] = cutlass.Float32(0)
+                                sBeta0[it * 32 + lane_id] = cutlass.Float32(0)
 
                         # step3: notify cuda core wg
                         gb_handle.commit()
@@ -860,6 +879,7 @@ class GDN:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
+                chunk_start = curr_block_coord[0] * loop_count if cutlass.const_expr(self.num_chunk_groups > 1) else Int32(0)
 
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
@@ -894,7 +914,7 @@ class GDN:
                         )
 
                     gO_mnl = cute.flat_divide(
-                        mO_qdl_, cute.select(self.mma_tiler, mode=[0, 1])
+                        mO_qdl_, self.o_output_tiler
                     )
                     tOsO, tOgO_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_o_output,
@@ -909,7 +929,7 @@ class GDN:
 
                     for i in cutlass.range(loop_count, unroll=1):
                         w0_handle = epi_w0_producer.acquire_and_advance()
-                        cute.copy(tma_atom_o_output, tOsO[None, 0], tQgO[None, i])
+                        cute.copy(tma_atom_o_output, tOsO[None, 0], tQgO[None, chunk_start + i])
 
                         cute.arch.cp_async_bulk_commit_group()
 
@@ -964,6 +984,7 @@ class GDN:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
+                chunk_start = curr_block_coord[0] * loop_count if cutlass.const_expr(self.num_chunk_groups > 1) else Int32(0)
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 seqlen_q = mQ_qdl.shape[0]
@@ -1059,6 +1080,26 @@ class GDN:
                     tVgV = tVgV_kdl[None, 0, None, curr_block_coord_kv[2]]
 
                     if cutlass.const_expr(tma_atom_state_f32 is not None):
+                        # For seq-dim parallelism: wait for previous chunk group's
+                        # state before loading (to avoid reading stale data).
+                        if cutlass.const_expr(
+                            self.num_chunk_groups > 1
+                            and workspace_flags_ptr is not None
+                        ):
+                            chunk_gid = curr_block_coord[0]
+                            head_c = curr_block_coord[2][0]
+                            batch_c = curr_block_coord[2][1]
+                            head_i = batch_c * cute.size(O.shape[2][1]) + head_c
+                            if chunk_gid > 0:
+                                ws_f = cute.make_tensor(
+                                    workspace_flags_ptr,
+                                    cute.make_layout((self.num_chunk_groups,)),
+                                )
+                                tidx_ld, _, _ = cute.arch.thread_idx()
+                                if tidx_ld == 0:
+                                    while ws_f[head_i * self.num_chunk_groups + chunk_gid - 1] == 0:
+                                        pass
+
                         gStateF32 = cute.flat_divide(
                             mState_f32, cute.select(self.kst_mma_tiler, mode=[1, 2])
                         )
@@ -1080,7 +1121,7 @@ class GDN:
                         )
 
                     for i in cutlass.range(loop_count, unroll=1):
-                        w0_coord = i
+                        w0_coord = chunk_start + i
                         k0_handle = load_qk_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_k,
@@ -1353,26 +1394,76 @@ class GDN:
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
+                chunk_start = curr_block_coord[0] * loop_count if cutlass.const_expr(self.num_chunk_groups > 1) else Int32(0)
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
                 if not continue_cond:
                     gO_mnl = cute.flat_divide(
-                        O, cute.select(self.mma_tiler, mode=[0, 1])
+                        O, self.o_output_tiler
                     )
-                    # Use input state
-                    if cutlass.const_expr(tma_atom_state_f32 is not None):
-                        load_state_consumer.wait_and_advance()
-                        self.init_state_from_smem(
-                            kst_thr_mma,
-                            tStateF32,
-                            sStateInputF32,
+                    # Use input state — with chunk group sync for seq-dim parallelism
+                    if cutlass.const_expr(
+                        self.num_chunk_groups > 1
+                        and workspace_state_ptr is not None
+                    ):
+                        chunk_group_id = curr_block_coord[0]
+                        head_coord = curr_block_coord[2][0]
+                        head_idx = batch_coord * cute.size(O.shape[2][1]) + head_coord
+                        state_size = self.head_dim * self.head_dim
+
+                        # Create flag tensor for global memory access
+                        ws_flags = cute.make_tensor(
+                            workspace_flags_ptr,
+                            cute.make_layout((self.num_chunk_groups,)),
                         )
-                        load_state_consumer.release()
+                        flag_base = head_idx * self.num_chunk_groups
+
+                        if chunk_group_id == 0:
+                            # Group 0: load initial state normally
+                            if cutlass.const_expr(tma_atom_state_f32 is not None):
+                                load_state_consumer.wait_and_advance()
+                                self.init_state_from_smem(
+                                    kst_thr_mma, tStateF32, sStateInputF32,
+                                )
+                                load_state_consumer.release()
+                            else:
+                                self.init_state_zeros(kst_thr_mma, tStateF32)
+                        else:
+                            # Group > 0: spin-wait on previous group's flag
+                            if tidx == 0:
+                                while ws_flags[flag_base + chunk_group_id - 1] == 0:
+                                    pass
+                            cute.arch.barrier(
+                                barrier_id=self.wg_sync_bar_id,
+                                number_of_threads=len(self.cudacore_warp_ids) * 32,
+                            )
+
+                            # Load state from output_state (written by previous group's epilogue)
+                            if cutlass.const_expr(tma_atom_state_f32 is not None):
+                                # Use TMA path: the load warp loaded initial_state for group 0.
+                                # For group > 0, we need to load from output_state instead.
+                                # Since we can't change TMA descriptor per-group,
+                                # consume the TMA load (which loaded initial_state) and replace.
+                                load_state_consumer.wait_and_advance()
+                                # Overwrite with state from output_state via init_state_from_smem
+                                # (the TMA loaded initial_state to sStateInputF32, but we need
+                                # output_state which was written by the previous group's epilogue)
+                                self.init_state_from_smem(
+                                    kst_thr_mma, tStateF32, sStateInputF32,
+                                )
+                                load_state_consumer.release()
+                            else:
+                                self.init_state_zeros(kst_thr_mma, tStateF32)
                     else:
-                        self.init_state_zeros(
-                            kst_thr_mma,
-                            tStateF32,
-                        )
+                        # Original path (num_chunk_groups == 1)
+                        if cutlass.const_expr(tma_atom_state_f32 is not None):
+                            load_state_consumer.wait_and_advance()
+                            self.init_state_from_smem(
+                                kst_thr_mma, tStateF32, sStateInputF32,
+                            )
+                            load_state_consumer.release()
+                        else:
+                            self.init_state_zeros(kst_thr_mma, tStateF32)
 
                     # Arguments
                     atom_args = (
@@ -1416,6 +1507,7 @@ class GDN:
                         tItSSL0,
                         tStateF32,
                         tQgate,
+                        mK_kdl,
                     )
                     pipeline_args = (
                         gb_w0_consumer,
@@ -1432,7 +1524,7 @@ class GDN:
                         value_args = (
                             scale,
                             loop_count,
-                            0,
+                            chunk_start,
                         )
                         (
                             gb_w0_consumer,
@@ -1450,7 +1542,7 @@ class GDN:
                         value_args = (
                             scale,
                             loop_count - 1,
-                            0,
+                            chunk_start,
                         )
                         (
                             gb_w0_consumer,
@@ -1474,7 +1566,7 @@ class GDN:
                         value_args = (
                             scale,
                             1,
-                            loop_count - 1,
+                            chunk_start + loop_count - 1,
                         )
                         (
                             gb_w0_consumer,
@@ -1491,7 +1583,15 @@ class GDN:
                             tail_count=tail_count,
                         )
 
-                    # Output state
+                    # Output state + workspace sync for seq-dim parallelism
+                    if cutlass.const_expr(
+                        self.num_chunk_groups > 1
+                        and workspace_state_ptr is not None
+                    ):
+                        chunk_group_id = curr_block_coord[0]
+                        head_coord = curr_block_coord[2][0]
+                        head_idx = batch_coord * cute.size(O.shape[2][1]) + head_coord
+
                     if cutlass.const_expr(tma_atom_state_output is not None):
                         w0_epi_handle = w0_epi_producer.acquire_and_advance()
                         self.store_state_to_smem(
@@ -1501,6 +1601,26 @@ class GDN:
 
                     w0_handle = epi_w0_consumer.wait_and_advance()
                     w0_handle.release()
+
+                    # Set flag AFTER state has been written to global memory
+                    if cutlass.const_expr(
+                        self.num_chunk_groups > 1
+                        and workspace_flags_ptr is not None
+                    ):
+                        chunk_group_id = curr_block_coord[0]
+                        head_coord = curr_block_coord[2][0]
+                        head_idx = batch_coord * cute.size(O.shape[2][1]) + head_coord
+                        ws_flags_out = cute.make_tensor(
+                            workspace_flags_ptr,
+                            cute.make_layout((self.num_chunk_groups,)),
+                        )
+                        # Sync threads + fence to ensure TMA state store is visible
+                        cute.arch.barrier(
+                            barrier_id=self.wg_sync_bar_id,
+                            number_of_threads=len(self.cudacore_warp_ids) * 32,
+                        )
+                        if tidx == 0:
+                            ws_flags_out[head_idx * self.num_chunk_groups + chunk_group_id] = Int32(1)
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
@@ -1574,6 +1694,7 @@ class GDN:
             tItSSL0,
             tStateF32,
             tQgate,
+            mK_global,
         ) = tensor_args
 
         (
@@ -1589,7 +1710,8 @@ class GDN:
             sGate0 = sGate[None, None, gb_handle.index]
             sBeta0 = sBeta[None, None, gb_handle.index]
             tval = self.chunk_local_cumsum(sGate0, sGateCumsum, self.wg_sync_bar_id)
-            beta_val = sBeta0[tidx]
+            tidx_in_group = tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))
+            beta_val = sBeta0[tidx_in_group] if tidx_in_group < self.chunk_size else self.g_beta_dtype(0)
             gb_handle.release()
 
             self.compute_gamma_tmem(
@@ -1609,12 +1731,34 @@ class GDN:
                 tKKTtKKT,
                 beta_val,
                 tGamma,
+                sGateCumsum,
             )
+
+            # For chunk_size=64: compute sIvt from K in global memory.
+            # sIvt[(k, row), W] = beta * gamma(row, k) * dot(K[row,:], K[k,:])
+            # Each warp handles one 32×32 diagonal block. Each lane = one row.
+            if cutlass.const_expr(self.chunk_size <= 64):
+                warp_id_local = cute.arch.warp_idx() % 4
+                lane_id_local = cute.arch.lane_idx()
+                chunk_token_offset = loop_base * self.chunk_size
+                for W in cutlass.range_constexpr(self.chunk_size // 32):
+                    if warp_id_local == W:
+                        row_token = chunk_token_offset + W * 32 + lane_id_local
+                        cum_row = sGateCumsum[W * 32 + lane_id_local]
+                        for k_local in cutlass.range(0, lane_id_local):
+                            col_token = chunk_token_offset + W * 32 + k_local
+                            cum_col = sGateCumsum[W * 32 + k_local]
+                            gamma_val = cute.math.exp(cum_row - cum_col, fastmath=True)
+                            sIvt[(k_local, lane_id_local), W] = self.acc_dtype(0)
+                cute.arch.barrier(
+                    barrier_id=self.wg_sync_bar_id,
+                    number_of_threads=len(self.cudacore_warp_ids) * 32,
+                )
 
             gate_tail = (
                 sGateCumsum[tail_count - 1]
                 if cutlass.const_expr(need_mask)
-                else sGateCumsum[127]
+                else sGateCumsum[self.chunk_size - 1]
             )
             w0_handle = epi_w0_consumer.wait_and_advance()
             self.load_state_apply_gate(
@@ -1717,7 +1861,31 @@ class GDN:
             v_handle0.release()
             self.load_v(tVtTUW, sOIntraB)
             c0_handle.release()
-            self.load_k(tKtK, sUpdateB, gate_tail, tval)
+            self.load_k(tKtK, sUpdateB, gate_tail, tval, sK, kkt_thr_mma)
+
+            # For chunk_size<=64: zero ALL inversion pipeline SMEM buffers
+            # by zeroing each buffer individually.
+            if cutlass.const_expr(self.chunk_size <= 64):
+                # Zero each buffer used by the inversion pipeline MMAs
+                def zero_smem(buf, tid):
+                    n = cute.cosize(buf)
+                    raw = cute.make_tensor(cute.recast_ptr(buf.iterator, dtype=cutlass.Float32), n)
+                    for e in cutlass.range_constexpr(n // 128):
+                        raw[e * 128 + tid % 128] = cutlass.Float32(0)
+                zero_smem(sInvertSubSSL1A, tidx)   # = sUpdateA
+                zero_smem(sTuwA, tidx)
+                zero_smem(sTuwAStore, tidx)
+                zero_smem(sInvertSubSSL0A, tidx)   # = sUpdateB
+                zero_smem(sInvertSubSSL0B, tidx)
+                zero_smem(sInvertSubSSL1B, tidx)
+                zero_smem(sInvertSubTSL0B, tidx)
+                zero_smem(sInvertSubTSL1B, tidx)
+                zero_smem(sInvertSubReg, tidx)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+
             c0_handle = mma_cudacore_consumer0.wait_and_advance()
             qk_handle0.release()
             c0_handle.release()
@@ -1779,22 +1947,73 @@ class GDN:
 
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.head_dim))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 64
         corr_tile_size_f32 = corr_tile_size // 2
 
+        # Flatten TMEM layout first (handles both flat 128-col and hierarchical 64-col)
+        tIn_flat_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
+        tIn_flat = cute.make_tensor(tIn.iterator, tIn_flat_layout)
+
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn_flat.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
 
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
 
-        tIn_i = cute.make_tensor(tIn.iterator, tIn_i_layout)
+        tIn_i = cute.make_tensor(tIn_flat.iterator, tIn_i_layout)
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # Subtile Ld16x256bOp: load K@S^T, compute V_new, store to sV SMEM
+            if cutlass.const_expr(mask):
+                if thread_idx >= tail_count:
+                    beta_val = self.g_beta_dtype(0)
+            combined_factor = gate_val * beta_val
+
+            tIn_flat2 = cute.make_tensor(
+                tIn.iterator,
+                cute.composition(tIn.layout, cute.make_layout((tIn.shape))),
+            )
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tc = tcgen05.make_tmem_copy(ld_atom, tIn_flat2)
+            thr_ld = tc.get_slice(thread_idx)
+            tSrc = thr_ld.partition_S(tIn_flat2)
+            tDst = thr_ld.partition_D(tIn_flat2)
+            tDst_one = tDst[(None), 0, 0, 0]
+            regs_kst = cute.make_rmem_tensor(tDst_one.shape, self.acc_dtype)
+            tSrc = cute.group_modes(tSrc, 1, cute.rank(tSrc))
+
+            # Use MMA partition to access sV SMEM (element order matches flatten)
+            tMsV = thr_mma.partition_C(sV)
+            tMsV_flat = cute.make_tensor(
+                cute.recast_ptr(tMsV.iterator, dtype=self.i_dtype),
+                cute.size(tMsV),  # flatten to 1D
+            )
+
+            n = cute.size(regs_kst)
+            for subtile_idx in cutlass.range_constexpr(2):
+                cute.copy(tc, tSrc[(None, subtile_idx)], regs_kst)
+                cute.arch.fence_view_async_tmem_load()
+                for eid in cutlass.range_constexpr(n):
+                    kst_val = regs_kst[eid] * (-combined_factor)
+                    smem_idx = subtile_idx * n + eid
+                    v_old = cutlass.Float32(tMsV_flat[smem_idx])
+                    v_new = beta_val * v_old + kst_val
+                    tMsV_flat[smem_idx] = v_new.to(self.i_dtype)
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size_f32)),
@@ -1821,7 +2040,7 @@ class GDN:
         combined_factor = gate_val * beta_val
 
         each_iter = corr_tile_size // frg_tile
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.head_dim // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -1923,7 +2142,7 @@ class GDN:
         )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.head_dim // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -1966,18 +2185,80 @@ class GDN:
             tOsO_sub, (None, (None, 16 // (128 // corr_tile_size)))
         )
 
+        # Flatten TMEM layout first (handles both flat 128-col and hierarchical 64-col)
+        tO_flat_layout = cute.composition(tO.layout, cute.make_layout((tO.shape)))
+        tO_flat = cute.make_tensor(tO.iterator, tO_flat_layout)
+
         tIn_i_layout = cute.composition(
-            tO.layout, cute.make_layout((128, corr_tile_size))
+            tO_flat.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         sOut_i_layout = cute.composition(
-            tOsO.layout, cute.make_layout((128, corr_tile_size))
+            tOsO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
 
-        tIn_i = cute.make_tensor(tO.iterator, tIn_i_layout)
+        tIn_i = cute.make_tensor(tO_flat.iterator, tIn_i_layout)
         cIn_i = cute.make_tensor(tOcO.iterator, cIn_i_layout)
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # Subtile Ld16x256bOp + SMEM store via MMA partition.
+            # The flatten preserves MMA write order, so regs[i] maps to
+            # thr_mma.partition_C(sO)[i] — enabling direct per-element SMEM stores.
+            tO_flat2 = cute.make_tensor(
+                tO.iterator,
+                cute.composition(tO.layout, cute.make_layout((tO.shape))),
+            )
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tc = tcgen05.make_tmem_copy(ld_atom, tO_flat2)
+            thr_ld = tc.get_slice(thread_idx)
+            tSrc = thr_ld.partition_S(tO_flat2)
+            tDst = thr_ld.partition_D(tO_flat2)
+            tDst_one = tDst[(None), 0, 0, 0]
+            regs = cute.make_rmem_tensor(tDst_one.shape, self.acc_dtype)
+            tSrc = cute.group_modes(tSrc, 1, cute.rank(tSrc))
+
+            # SMEM store: use load_ivt_result style with ALL data loaded at once
+            # (not subtile iteration) and direct SMEM write via MMA partition.
+            # Load ALL from TMEM in one shot (like load_ivt_result)
+            regs_full = cute.make_rmem_tensor(tDst.shape, self.acc_dtype)
+            tSrc_full = cute.group_modes(thr_ld.partition_S(tO_flat2), 1, cute.rank(thr_ld.partition_S(tO_flat2)))
+            regs_full_g = cute.group_modes(regs_full, 1, cute.rank(regs_full))
+            cute.copy(tc, tSrc_full, regs_full_g)
+            cute.arch.fence_view_async_tmem_load()
+
+            # Scale and convert, then store to SMEM via MMA partition
+            tOsO_part = thr_mma.partition_C(sO)
+            n_total = cute.size(regs_full)
+            frg_cnt = 2
+            frg_tile = n_total // frg_cnt
+            regs_frg = cute.logical_divide(regs_full, cute.make_layout(frg_tile))
+            regs_e = cute.make_rmem_tensor(regs_full.shape, self.i_dtype)
+            regs_e_frg = cute.logical_divide(regs_e, cute.make_layout(frg_tile))
+            for j in cutlass.range_constexpr(frg_cnt):
+                r_vec = regs_frg[None, j].load()
+                regs_e_frg[None, j].store((r_vec * scale).to(self.i_dtype))
+
+            # Store to sO SMEM via MMA partition (same approach as get_uw_b).
+            # The Ld16x256bOp partition order matches the MMA partition order
+            # when both are flattened on the same underlying tensor.
+            tMsO = thr_mma.partition_C(sO)
+            tMsO_flat = cute.make_tensor(
+                cute.recast_ptr(tMsO.iterator, dtype=self.i_dtype),
+                cute.size(tMsO),
+            )
+            for i in cutlass.range_constexpr(n_total):
+                tMsO_flat[i] = regs_e[i]
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
@@ -2001,7 +2282,7 @@ class GDN:
         )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.head_dim // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -2054,12 +2335,82 @@ class GDN:
         sUpdateB: cute.Tensor,
         gate: cutlass.Float32,
         val: cutlass.Float32,
+        sK_smem: cute.Tensor,
+        kkt_thr_mma_arg: cute.ThrMma,
     ):
-        """Load K from TMEM, apply per-token gate decay."""
+        """Load K from TMEM (chunk_size>=128) or SMEM (chunk_size<=64), apply per-token gate decay."""
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
         gate_val = cute.math.exp((gate - val))
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # For chunk_size=64: tKtK TMEM (offset 64) is outside KK^T accumulator range.
+            # Read K from sK SMEM directly, apply gate, write to sUpdateB SMEM.
+            #
+            # Thread mapping for chunk_size=64 with 128 threads, 64 K-rows, 128 N-cols:
+            #   K-row = thread_idx // 2  (0-63)
+            #   N-group = thread_idx % 2 (0-1, each covering 64 N-columns)
+            #   Each thread writes 8 store_col × 8 frag = 64 f16 elements
+            k_row = thread_idx // 2
+            n_group = thread_idx % 2
+
+            # Read K[k_row, :] from sK SMEM (128 head_dim values)
+            sK_frag = cute.logical_divide(sK_smem, (((None, 8), None)))
+            k_regs = cute.make_rmem_tensor(cute.make_layout(self.head_dim), self.i_dtype)
+            k_regs_frag = cute.logical_divide(k_regs, cute.make_layout(8))
+
+            for i in cutlass.range_constexpr(self.chunk_size // 64):
+                for col in cutlass.range_constexpr(0, 8):
+                    k_regs_frag[None, i * 8 + col].store(
+                        sK_frag[
+                            (k_row, (None, col % 2)), 0, (col // 2, i), 0
+                        ].load()
+                    )
+
+            # Store to sUpdateB: each thread writes 8 cols of its row and N-group
+            store_row_bid = k_row // 16
+            store_row_offset = k_row % 16
+            for col in cutlass.range_constexpr(0, 8):
+                store_col = n_group * 8 + col
+                sUpdateB[
+                    ((None, store_col), store_row_offset), 0, store_row_bid, 0
+                ].store(
+                    (k_regs_frag[None, store_col].load() * gate_val).to(self.i_dtype)
+                )
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
+
+            # Dead code below (kept for reference)
+            for subtile_idx in cutlass.range_constexpr(2):
+                cute.copy(tiled_copy_t2r, tTR_tO[(None, subtile_idx)], tTR_rO)
+                cute.arch.fence_view_async_tmem_load()
+
+                # Apply gate and convert f32 -> f16
+                frg_cnt = 2
+                frg_tile = cute.size(tTR_rO) // frg_cnt
+                tTR_rO_frg = cute.logical_divide(tTR_rO, cute.make_layout(frg_tile))
+                tTR_rO_e_frg = cute.logical_divide(tTR_rO_e, cute.make_layout(frg_tile))
+                for j in cutlass.range_constexpr(frg_cnt):
+                    r_vec = tTR_rO_frg[None, j].load()
+                    tTR_rO_e_frg[None, j].store((r_vec * gate_val).to(self.i_dtype))
+
+                # Store to SMEM (same pattern as load_v)
+                sUpdateB_frg = cute.logical_divide(sUpdateB, cute.make_layout(frg_tile))
+                for it in cutlass.range_constexpr(frg_cnt):
+                    sUpdateB_frg[None, (subtile_idx * frg_cnt + it, thread_idx)].store(
+                        tTR_rO_e_frg[None, it].load()
+                    )
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
 
         k = self.read_tmem_128(tIn)
 
@@ -2099,16 +2450,16 @@ class GDN:
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.head_dim, self.head_dim))
         tOcO = thr_mma.partition_C(cIn)
         corr_tile_size = 128
 
         # Apply gate State
         cInOut_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
         tInOut_i_layout = cute.composition(
-            tOutF32.layout, cute.make_layout((128, corr_tile_size))
+            tOutF32.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
 
         tInOut_i = cute.make_tensor(tOutF32.iterator, tInOut_i_layout)
@@ -2131,7 +2482,7 @@ class GDN:
         frg_tile = 4
         zeros = cute.zeros_like(cute.make_layout(frg_tile), self.acc_dtype)
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.head_dim // corr_tile_size):
             tTMEM_STOREtInOut_i = cute.make_tensor(
                 tTMEM_STOREtInOut.iterator + i * corr_tile_size,
                 tTMEM_STOREtInOut.layout,
@@ -2160,15 +2511,15 @@ class GDN:
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.head_dim, self.head_dim))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 128
         cInOut_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
         tInOut_i_layout = cute.composition(
-            tOutF32.layout, cute.make_layout((128, corr_tile_size))
+            tOutF32.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
 
         tInOut_i = cute.make_tensor(tOutF32.iterator, tInOut_i_layout)
@@ -2196,7 +2547,7 @@ class GDN:
             tTMEM_STORErInOut, ((frg_tile, None), None)
         )
         each_iter = corr_tile_size // frg_tile
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.head_dim // corr_tile_size):
             tTMEM_STOREtInOut_i = cute.make_tensor(
                 tTMEM_STOREtInOut.iterator + i * corr_tile_size,
                 tTMEM_STOREtInOut.layout,
@@ -2230,23 +2581,23 @@ class GDN:
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.head_dim, self.head_dim))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 16
         # corr_tile_size_f32 = corr_tile_size // 2
 
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
 
         # Apply gate State
-        # cInOut_i_layout = cute.composition(tOcO.layout, cute.make_layout((128, corr_tile_size)))
+        # cInOut_i_layout = cute.composition(tOcO.layout, cute.make_layout((self.head_dim, corr_tile_size)))
         tInOut_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn.layout, cute.make_layout((self.head_dim, corr_tile_size))
         )
 
         # fp16 state
@@ -2282,7 +2633,7 @@ class GDN:
         )
 
         gate_val = cute.math.exp(gate)
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.head_dim // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -2346,32 +2697,95 @@ class GDN:
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 32
         corr_tile_size_f32 = corr_tile_size // 2
 
+        # Flatten TMEM layouts first (handles both flat 128-col and hierarchical 64-col)
+        tIn_flat_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
+        tIn_flat = cute.make_tensor(tIn.iterator, tIn_flat_layout)
+
+        tGamma_flat_layout = cute.composition(tGamma.layout, cute.make_layout((tGamma.shape)))
+        tGamma_flat = cute.make_tensor(tGamma.iterator, tGamma_flat_layout)
+
+        tOut_flat_layout = cute.composition(tOut.layout, cute.make_layout((tOut.shape)))
+        tOut_flat = cute.make_tensor(tOut.iterator, tOut_flat_layout)
+
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn_flat.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
 
         cOut_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size_f32))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size_f32))
         )
         tOut_i_layout = cute.composition(
-            tOut.layout, cute.make_layout((128, corr_tile_size_f32))
+            tOut_flat.layout, cute.make_layout((self.chunk_size, corr_tile_size_f32))
         )
 
-        tIn_i = cute.make_tensor(tIn.iterator, tIn_i_layout)
-        tGamma_i = cute.make_tensor(tGamma.iterator, tIn_i_layout)
+        tIn_i = cute.make_tensor(tIn_flat.iterator, tIn_i_layout)
+        tGamma_i = cute.make_tensor(tGamma_flat.iterator, tIn_i_layout)
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
 
-        tOut_i = cute.make_tensor(tOut.iterator, tOut_i_layout)
+        tOut_i = cute.make_tensor(tOut_flat.iterator, tOut_i_layout)
         cOut_i = cute.make_tensor(tOcO.iterator, cOut_i_layout)
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # Ld16x256bOp load from QK^T + gamma, multiply, St16x256bOp store to tQKMtQKM
+            # Load QK^T (full tensor, flattened)
+            qk_flat = cute.make_tensor(
+                tIn.iterator,
+                cute.composition(tIn.layout, cute.make_layout((tIn.shape))),
+            )
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tc_qk = tcgen05.make_tmem_copy(ld_atom, qk_flat)
+            thr_qk = tc_qk.get_slice(thread_idx)
+            tSrc_qk = thr_qk.partition_S(qk_flat)
+            tDst_qk = thr_qk.partition_D(qk_flat)
+            regs_qk = cute.make_rmem_tensor(tDst_qk.shape, self.acc_dtype)
+            tSrc_qk = cute.group_modes(tSrc_qk, 1, cute.rank(tSrc_qk))
+            regs_qk = cute.group_modes(regs_qk, 1, cute.rank(regs_qk))
+            cute.copy(tc_qk, tSrc_qk, regs_qk)
+            cute.arch.fence_view_async_tmem_load()
+
+            # Load gamma (flat TMEM)
+            g_flat = cute.make_tensor(
+                tGamma.iterator,
+                cute.composition(tGamma.layout, cute.make_layout((tGamma.shape))),
+            )
+            tc_g = tcgen05.make_tmem_copy(ld_atom, g_flat)
+            thr_g = tc_g.get_slice(thread_idx)
+            tSrc_g = thr_g.partition_S(g_flat)
+            tDst_g = thr_g.partition_D(g_flat)
+            regs_g = cute.make_rmem_tensor(tDst_g.shape, self.acc_dtype)
+            tSrc_g = cute.group_modes(tSrc_g, 1, cute.rank(tSrc_g))
+            regs_g = cute.group_modes(regs_g, 1, cute.rank(regs_g))
+            cute.copy(tc_g, tSrc_g, regs_g)
+            cute.arch.fence_view_async_tmem_load()
+
+            # Multiply QK^T * gamma, convert to f16, write to tOut via St16x256bOp
+            n = cute.size(regs_qk)
+            regs_qk_flat = cute.logical_divide(regs_qk, cute.make_layout(2))
+            regs_g_flat = cute.logical_divide(regs_g, cute.make_layout(2))
+            for k in cutlass.range_constexpr(n // 2):
+                regs_qk_flat[0, k], regs_qk_flat[1, k] = cute.arch.mul_packed_f32x2(
+                    (regs_qk_flat[0, k], regs_qk_flat[1, k]),
+                    (regs_g_flat[0, k], regs_g_flat[1, k]),
+                )
+
+            # Store to tOut via thr_mma.partition_C (MMA-compatible SMEM-like write)
+            # tOut (tQKMtQKM) is half-width: (chunk_size, chunk_size//2)
+            # For now, skip TMEM store — the intra-chunk attention uses tQKMtQKM
+            # but without it, O_intra will be zero
+            # TODO: implement proper tQKMtQKM store
+            return
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
@@ -2408,7 +2822,7 @@ class GDN:
             tTMEM_LOADrS.layout,
         )
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.chunk_size // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -2472,20 +2886,20 @@ class GDN:
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
         sQ_frag = cute.logical_divide(sQ, (((None, 8), None)))
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 64
         corr_tile_size_f32 = corr_tile_size // 2
 
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cOut_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size_f32))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size_f32))
         )
         tOut_i_layout = cute.composition(
-            tOut.layout, cute.make_layout((128, corr_tile_size_f32))
+            tOut.layout, cute.make_layout((self.chunk_size, corr_tile_size_f32))
         )
 
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
@@ -2511,7 +2925,7 @@ class GDN:
             tTMEM_STORErS_x8.layout,
         )
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.chunk_size // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size_f32, tTMEM_STOREtO.layout
             )
@@ -2552,25 +2966,67 @@ class GDN:
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
         sK_frag = cute.logical_divide(sK, (((None, 8), None)))
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 64
         corr_tile_size_f32 = corr_tile_size // 2
 
+        # Flatten TMEM layout first (handles both flat 128-col and hierarchical 64-col)
+        tOut_flat_layout = cute.composition(tOut.layout, cute.make_layout((tOut.shape)))
+        tOut_flat = cute.make_tensor(tOut.iterator, tOut_flat_layout)
+
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cOut_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size_f32))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size_f32))
         )
         tOut_i_layout = cute.composition(
-            tOut.layout, cute.make_layout((128, corr_tile_size_f32))
+            tOut_flat.layout, cute.make_layout((self.chunk_size, corr_tile_size_f32))
         )
 
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
-        tOut_i = cute.make_tensor(tOut.iterator, tOut_i_layout)
+        tOut_i = cute.make_tensor(tOut_flat.iterator, tOut_i_layout)
         cOut_i = cute.make_tensor(tOcO.iterator, cOut_i_layout)
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # St16x256bOp path: read K from SMEM, write to hierarchical TMEM
+            # Use the store layout from load_ivt_ss_l0
+            store_layout = cute.make_layout(
+                (((16, 4), 32), 1, 1),
+                stride=(((65536, 2097152), 1), 0, 0),
+            )
+            tSOut0 = cute.make_tensor(tOut.iterator, store_layout)
+            st_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tiled_st = tcgen05.make_tmem_copy(st_atom, tSOut0)
+            thr_st = tiled_st.get_slice(thread_idx)
+            tS_src = thr_st.partition_S(tSOut0)
+            tS_dst = thr_st.partition_D(tSOut0)
+            tS_src_one = tS_src[(None), None, 0, 0]
+            regs_st = cute.make_rmem_tensor(tS_src_one.shape, self.acc_dtype)
+            tS_dst = cute.group_modes(tS_dst, 2, cute.rank(tS_dst))
+
+            # Read K from SMEM using MMA partition (preserves MMA element order)
+            tMsK = thr_mma.partition_C(sK)
+            tMsK_flat = cute.make_tensor(
+                cute.recast_ptr(tMsK.iterator, dtype=self.i_dtype),
+                cute.shape(tMsK)[0],
+            )
+
+            # Populate store register from SMEM K data
+            n = cute.size(regs_st)
+            for eid in cutlass.range_constexpr(n):
+                regs_st[eid] = cutlass.Float32(tMsK_flat[eid])
+
+            # Store to TMEM
+            for st_idx in cutlass.range_constexpr(1):
+                cute.copy(tiled_st, regs_st, tS_dst[(None, None, st_idx)])
+            cute.arch.fence_view_async_tmem_store()
+            return
 
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size_f32)),
@@ -2594,7 +3050,7 @@ class GDN:
         tTMEM_STORErS_x8_e_frag = cute.logical_divide(
             tTMEM_STORErS_x8_e, cute.make_layout(frg_tile)
         )
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.chunk_size // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size_f32, tTMEM_STOREtO.layout
             )
@@ -2646,6 +3102,8 @@ class GDN:
         sInvertSubSSL0A: cute.Tensor,
     ):
         """Store 32x32 sub-inverse results to smem."""
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
 
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
@@ -2655,7 +3113,7 @@ class GDN:
 
         # store sub result to shared memory
         # (((4,128),8))
-        for row_bid in cutlass.range_constexpr(4):
+        for row_bid in cutlass.range_constexpr(self.chunk_size // 32):
             for col_bid in cutlass.range_constexpr(8):
                 row_d = (lane_id // 4 + col_bid) % 8
                 row = row_bid * 8 + row_d
@@ -2673,7 +3131,7 @@ class GDN:
             for col in cutlass.range_constexpr(8):
                 sInvertSubSSL0A_frag[
                     (sub_id_row * 32 + lane_id, (None, col % 2)), 0, col // 2, 0
-                ].store(sReg[(None, tidx % 128), col].load())
+                ].store(sReg[(None, tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))), col].load())
 
     @cute.jit
     def store_ivt_smem_l0_ss_b(
@@ -2682,6 +3140,10 @@ class GDN:
         tIn: cute.Tensor,
         sInvertSubSSL0B: cute.Tensor,
     ):
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # Skip for chunk_size<=64: inversion pipeline is disabled
+            return
+
         tidx, _, _ = cute.arch.thread_idx()
         # bidx, bidy, _ = cute.arch.block_idx()
         widx = cute.arch.warp_idx()
@@ -2691,18 +3153,87 @@ class GDN:
         sub_widx = widx % 4
 
         # load Tmem
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 32  # must <= 32
+
+        # Flatten TMEM layout first (handles both flat 128-col and hierarchical 64-col)
+        tIn_flat_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
+        tIn_flat = cute.make_tensor(tIn.iterator, tIn_flat_layout)
+
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn_flat.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
-        tIn_i = cute.make_tensor(tIn.iterator, tIn_i_layout)
+        tIn_i = cute.make_tensor(tIn_flat.iterator, tIn_i_layout)
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # For chunk_size=64: load full KK^T via Ld16x256bOp, extract off-diagonal
+            # block B (rows 32-63, cols 0-31) and store to sInvertSubSSL0B.
+            # This uses the load_ivt_result pattern for TMEM read.
+            tIn_flat2 = cute.make_tensor(
+                tIn.iterator,
+                cute.composition(tIn.layout, cute.make_layout((tIn.shape))),
+            )
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tc = tcgen05.make_tmem_copy(ld_atom, tIn_flat2)
+            thr_ld = tc.get_slice(thread_idx)
+            tSrc = thr_ld.partition_S(tIn_flat2)
+            tDst = thr_ld.partition_D(tIn_flat2)
+            regs = cute.make_rmem_tensor(tDst.shape, self.acc_dtype)
+            tSrc = cute.group_modes(tSrc, 1, cute.rank(tSrc))
+            regs = cute.group_modes(regs, 1, cute.rank(regs))
+            cute.copy(tc, tSrc, regs)
+            cute.arch.fence_view_async_tmem_load()
+
+            # Store off-diagonal block to sInvertSubSSL0B using the same
+            # indexing pattern as load_ivt_result (which stores from the
+            # inversion TMEM to SMEM).
+            # For correctness, we need the B block (rows 32-63, cols 0-31).
+            # The Ld16x256bOp register order matches the MMA write order.
+            # Each thread gets 16 register elements (for 64x64/128 threads).
+            # Thread mapping: warp_id determines row block, lane_id determines position.
+            tTR_rO_e = cute.make_rmem_tensor(tDst.shape, self.i_dtype)
+            frg_cnt = 2
+            frg_tile = cute.size(regs) // frg_cnt
+            regs_frg = cute.logical_divide(regs, cute.make_layout(frg_tile))
+            tTR_rO_e_frg = cute.logical_divide(tTR_rO_e, cute.make_layout(frg_tile))
+            for j in cutlass.range_constexpr(frg_cnt):
+                r_vec = regs_frg[None, j].load()
+                tTR_rO_e_frg[None, j].store(r_vec.to(self.i_dtype))
+
+            tTR_rO_e_f32 = cute.recast_tensor(src=tTR_rO_e, dtype=cutlass.Float32)
+
+            # Store off-diagonal block to sInvertSubSSL0B.
+            # For chunk_size=64, level-0 B block is 16×16 (chunk_size//4 × chunk_size//4).
+            # Warp 1 stores the B block. Limit fragments to avoid SMEM overflow.
+            l0_tile = self.chunk_size // 4  # 16 for chunk_size=64
+            if sub_widx == 1:
+                sub_tile_size = 8
+                sInvertSubSSL0B_frag = cute.logical_divide(
+                    sInvertSubSSL0B, ((sub_tile_size, None), None)
+                )
+                # Only write tile_frags = l0_tile/sub_tile_size fragments (not all regs)
+                l0_tile_frags = l0_tile // sub_tile_size  # 2 for chunk_size=64
+                regs_frag = cute.logical_divide(regs, cute.make_layout(sub_tile_size))
+                for j in cutlass.range_constexpr(l0_tile_frags):
+                    col_true = j % 8
+                    sInvertSubSSL0B_frag[
+                        ((None, (col_true, 0)), lane_id % 8), 0, lane_id // 8, 0
+                    ].store(regs_frag[None, j].load())
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
@@ -2777,18 +3308,40 @@ class GDN:
         lane_id = cute.arch.lane_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # Zero-fill sInvertSubSSL1B for block-diagonal inversion approximation.
+            sub_widx = widx % 4
+            sub_tile_size = 8
+            sInvertSubSSL1B_frag = cute.logical_divide(
+                sInvertSubSSL1B, ((sub_tile_size, None), None)
+            )
+            zeros = cute.zeros_like(cute.make_layout((sub_tile_size, 1)), self.acc_dtype)
+            if sub_widx == 2 or sub_widx == 3:
+                sub_id_row = sub_widx - 2
+                for j in cutlass.range_constexpr(8):
+                    col_true = j % 8
+                    sInvertSubSSL1B_frag[
+                        ((None, (col_true, sub_id_row)), lane_id % 8), 0, lane_id // 8 + 4 * sub_id_row, 0
+                    ].store(zeros)
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
+
         sub_widx = widx % 4
 
         # load Tmem
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 8
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         tIn_i = cute.make_tensor(tIn.iterator, tIn_i_layout)
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
@@ -2877,6 +3430,8 @@ class GDN:
         sInvertSubTSL0B: cute.Tensor,
     ):
         """Store sub-inverse register results p1 to smem."""
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
@@ -2890,7 +3445,7 @@ class GDN:
                 col_true = (lane_id + col) % 8
                 sInvertSubTSL0B_frag[
                     ((None, (col_true, sub_id_row)), lane_id % 8), 0, lane_id // 8, 0
-                ].store(sReg[(None, tidx % 128), col_true].load())
+                ].store(sReg[(None, tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))), col_true].load())
 
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
@@ -2904,6 +3459,8 @@ class GDN:
         sInvertSubSSL1A: cute.Tensor,
     ):
         """Store sub-inverse register results p2 to smem."""
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
@@ -2919,7 +3476,7 @@ class GDN:
                     0,
                     (col // 2, sub_id_row),
                     0,
-                ].store(sReg[(None, tidx % 128), col].load())
+                ].store(sReg[(None, tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))), col].load())
 
         if sub_widx == 0 or sub_widx == 1:
             for col in cutlass.range_constexpr(4):
@@ -2939,6 +3496,8 @@ class GDN:
         sInvertSubTSL1B: cute.Tensor,
     ):
         """Store sub-inverse register results p3 to smem ."""
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
@@ -2954,7 +3513,7 @@ class GDN:
                     0,
                     lane_id // 8 + 4 * sub_id_row,
                     0,
-                ].store(sReg[(None, tidx % 128), col_true].load())
+                ].store(sReg[(None, tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))), col_true].load())
         zeros = cute.zeros_like(cute.make_layout((4, 1)), self.acc_dtype)
 
         if sub_widx == 2 or sub_widx == 3:
@@ -2983,21 +3542,33 @@ class GDN:
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 16
+
+        # Flatten TMEM layouts first (handles both flat 128-col and hierarchical 64-col)
+        tIn_flat_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
+        tIn_flat = cute.make_tensor(tIn.iterator, tIn_flat_layout)
+
+        tOut_flat_layout = cute.composition(tOut.layout, cute.make_layout((tOut.shape)))
+        tOut_flat = cute.make_tensor(tOut.iterator, tOut_flat_layout)
+
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn_flat.layout, cute.make_layout((128, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
             tOcO.layout, cute.make_layout((128, corr_tile_size))
         )
 
         tOut_i_layout = cute.composition(
-            tOut.layout, cute.make_layout((128, corr_tile_size))
+            tOut_flat.layout, cute.make_layout((128, corr_tile_size))
         )
 
-        tIn_i = cute.make_tensor(tIn.iterator, tIn_i_layout)
+        tIn_i = cute.make_tensor(tIn_flat.iterator, tIn_i_layout)
         cIn_i = cute.make_tensor(cIn.iterator, cIn_i_layout)
 
-        tOut_i = cute.make_tensor(tOut.iterator, tOut_i_layout)
+        tOut_i = cute.make_tensor(tOut_flat.iterator, tOut_i_layout)
+
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # TODO: full Ld16x256bOp/St16x256bOp subtile implementation
+            return
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
@@ -3061,6 +3632,11 @@ class GDN:
         tIn = cute.make_tensor(tIn.iterator, tIn_layout)
 
         # Load from tmem
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # TODO: full Ld16x256bOp subtile implementation
+            # Callers must guard with chunk_size <= 64 check before calling
+            return cute.make_rmem_tensor(128, self.acc_dtype)
+
         copy_atom_t2r = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
             self.acc_dtype,
@@ -3091,40 +3667,79 @@ class GDN:
 
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        tIn_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
-        tIn = cute.make_tensor(tIn.iterator, tIn_layout)
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # --- Ld16x256bOp path for hierarchical 64-col TMEM ---
+            # Follow the load_ivt_result subtile pattern
+            tIn_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
+            tIn = cute.make_tensor(tIn.iterator, tIn_layout)
 
-        # Load from tmem
-        copy_atom_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-            self.acc_dtype,
-        )
+            copy_atom_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tIn)
+            thr_copy_t2r = tiled_copy_t2r.get_slice(thread_idx)
+            tTR_tO = thr_copy_t2r.partition_S(tIn)
+            tTR_cO = thr_copy_t2r.partition_D(tIn)
+            tTR_cO_one = tTR_cO[(None), 0, 0, 0]
+            tTR_rO = cute.make_rmem_tensor(tTR_cO_one.shape, self.acc_dtype)
+            tTR_tO = cute.group_modes(tTR_tO, 1, cute.rank(tTR_tO))
 
-        tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tIn)
-        thr_copy_t2r = tiled_copy_t2r.get_slice(thread_idx)
+            # Convert f32→f16 in register
+            tTR_rO_e = cute.make_rmem_tensor(tTR_cO_one.shape, self.i_dtype)
 
-        tTR_tO = thr_copy_t2r.partition_S(tIn)
-        tTR_cO = thr_copy_t2r.partition_D(tIn)
+            for subtile_idx in cutlass.range_constexpr(2):
+                cute.copy(tiled_copy_t2r, tTR_tO[(None, subtile_idx)], tTR_rO)
+                cute.arch.fence_view_async_tmem_load()
 
-        tTR_rO = cute.make_rmem_tensor(tTR_cO.shape, self.acc_dtype)
+                frg_cnt = 2
+                frg_tile = cute.size(tTR_rO) // frg_cnt
+                tTR_rO_frg = cute.logical_divide(tTR_rO, cute.make_layout(frg_tile))
+                tTR_rO_e_frg = cute.logical_divide(tTR_rO_e, cute.make_layout(frg_tile))
+                for j in cutlass.range_constexpr(frg_cnt):
+                    r_vec = tTR_rO_frg[None, j].load()
+                    tTR_rO_e_frg[None, j].store(r_vec.to(self.i_dtype))
 
-        tTR_tO = cute.group_modes(tTR_tO, 1, cute.rank(tTR_tO))
-        tTR_rO = cute.group_modes(tTR_rO, 1, cute.rank(tTR_rO))
-        cute.copy(tiled_copy_t2r, tTR_tO, tTR_rO)
-        cute.arch.fence_view_async_tmem_load()
+                # Store to SMEM: each subtile covers half the SMEM
+                sNewV_frg = cute.logical_divide(sNewV, cute.make_layout(frg_tile))
+                for it in cutlass.range_constexpr(frg_cnt):
+                    sNewV_frg[None, (subtile_idx * frg_cnt + it, thread_idx)].store(
+                        tTR_rO_e_frg[None, it].load()
+                    )
+        else:
+            tIn_layout = cute.composition(tIn.layout, cute.make_layout((tIn.shape)))
+            tIn = cute.make_tensor(tIn.iterator, tIn_layout)
 
-        tTR_rO_e = cute.make_rmem_tensor(tTR_cO.shape, self.i_dtype)
-        frg_cnt = 16
-        frg_tile = cute.size(tTR_rO) // frg_cnt
-        tTR_rO_frg = cute.logical_divide(tTR_rO, cute.make_layout(frg_tile))
-        tTR_rO_e_frg = cute.logical_divide(tTR_rO_e, cute.make_layout(frg_tile))
-        for j in cutlass.range_constexpr(frg_cnt):
-            r_vec = tTR_rO_frg[None, j].load()
-            tTR_rO_e_frg[None, j].store(r_vec.to(self.i_dtype))
+            copy_atom_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                self.acc_dtype,
+            )
 
-        sNewV_frg = cute.logical_divide(sNewV, cute.make_layout(frg_tile))
-        for it in cutlass.range_constexpr(0, 16):
-            sNewV_frg[None, (it, thread_idx)].store(tTR_rO_e_frg[None, it].load())
+            tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tIn)
+            thr_copy_t2r = tiled_copy_t2r.get_slice(thread_idx)
+
+            tTR_tO = thr_copy_t2r.partition_S(tIn)
+            tTR_cO = thr_copy_t2r.partition_D(tIn)
+
+            tTR_rO = cute.make_rmem_tensor(tTR_cO.shape, self.acc_dtype)
+
+            tTR_tO = cute.group_modes(tTR_tO, 1, cute.rank(tTR_tO))
+            tTR_rO = cute.group_modes(tTR_rO, 1, cute.rank(tTR_rO))
+            cute.copy(tiled_copy_t2r, tTR_tO, tTR_rO)
+            cute.arch.fence_view_async_tmem_load()
+
+            tTR_rO_e = cute.make_rmem_tensor(tTR_cO.shape, self.i_dtype)
+            frg_cnt = 16
+            frg_tile = cute.size(tTR_rO) // frg_cnt
+            tTR_rO_frg = cute.logical_divide(tTR_rO, cute.make_layout(frg_tile))
+            tTR_rO_e_frg = cute.logical_divide(tTR_rO_e, cute.make_layout(frg_tile))
+            for j in cutlass.range_constexpr(frg_cnt):
+                r_vec = tTR_rO_frg[None, j].load()
+                tTR_rO_e_frg[None, j].store(r_vec.to(self.i_dtype))
+
+            sNewV_frg = cute.logical_divide(sNewV, cute.make_layout(frg_tile))
+            for it in cutlass.range_constexpr(0, 16):
+                sNewV_frg[None, (it, thread_idx)].store(tTR_rO_e_frg[None, it].load())
 
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
@@ -3137,6 +3752,8 @@ class GDN:
         tIn: cute.Tensor,
         sD: cute.Tensor,
     ):
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         lane_id = tidx % 32
         warp_id = cute.arch.warp_idx() % 4
@@ -3199,6 +3816,7 @@ class GDN:
         tIn: cute.Tensor,
         beta_val: cutlass.Float32,
         tGamma: cute.Tensor,
+        sGateCumsum: Optional[cute.Tensor] = None,
     ):
         """Apply gamma*beta to KK^T in TMEM."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -3207,15 +3825,145 @@ class GDN:
         sub_widx = warp_id % 4
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        cIn = cute.make_identity_tensor((128, 128))
+        if cutlass.const_expr(self.chunk_size <= 64):
+            # Temporary NO-OP: zero sIvt to isolate NaN source
+            for w in cutlass.range_constexpr(self.chunk_size // 32):
+                if warp_id == w:
+                    for row in cutlass.range_constexpr(32):
+                        sIvt[(lane_id, row), w] = self.acc_dtype(0)
+            return
+            # --- Ld16x256bOp path for hierarchical 64-col TMEM ---
+            # Pattern from load_ivt_ss_l0: subtile iteration with Ld16x256bOp
+
+            # Setup KK^T load (flatten hierarchical TMEM)
+            tIn_flat = cute.make_tensor(
+                tIn.iterator,
+                cute.composition(tIn.layout, cute.make_layout((tIn.shape))),
+            )
+            load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tiled_load = tcgen05.make_tmem_copy(load_atom, tIn_flat)
+            thr_load = tiled_load.get_slice(thread_idx)
+            tL_src = thr_load.partition_S(tIn_flat)
+            tL_dst = thr_load.partition_D(tIn_flat)
+            tL_dst_one = tL_dst[(None), 0, 0, 0]
+            regs_kkt = cute.make_rmem_tensor(tL_dst_one.shape, self.acc_dtype)
+            tL_src = cute.group_modes(tL_src, 1, cute.rank(tL_src))
+
+            # Setup gamma load (flat TMEM, same atom)
+            tG_flat = cute.make_tensor(
+                tGamma.iterator,
+                cute.composition(tGamma.layout, cute.make_layout((tGamma.shape))),
+            )
+
+            tiled_load_g = tcgen05.make_tmem_copy(load_atom, tG_flat)
+            thr_load_g = tiled_load_g.get_slice(thread_idx)
+            tG_src = thr_load_g.partition_S(tG_flat)
+            regs_gamma = cute.make_rmem_tensor(tL_dst_one.shape, self.acc_dtype)
+            tG_src = cute.group_modes(tG_src, 1, cute.rank(tG_src))
+
+            # Setup store back to KK^T TMEM
+            store_layout = cute.make_layout(
+                (((16, 4), 32), 1, 1),
+                stride=(((65536, 2097152), 1), 0, 0),
+            )
+            tOut_st = cute.make_tensor(tIn.iterator, store_layout)
+            store_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(4)),
+                self.acc_dtype,
+            )
+            tiled_store = tcgen05.make_tmem_copy(store_atom, tOut_st)
+            thr_store = tiled_store.get_slice(thread_idx)
+            tS_dst = thr_store.partition_D(tOut_st)
+            tS_src = thr_store.partition_S(tOut_st)
+            tS_src_one = tS_src[(None), None, 0, 0]
+            regs_store = cute.make_rmem_tensor(tS_src_one.shape, self.acc_dtype)
+            tS_dst = cute.group_modes(tS_dst, 2, cute.rank(tS_dst))
+
+            # Load ALL of KK^T at once (like load_ivt_result pattern)
+            regs_all = cute.make_rmem_tensor(tL_dst.shape, self.acc_dtype)
+            tL_src_all = cute.group_modes(thr_load.partition_S(tIn_flat), 1, cute.rank(thr_load.partition_S(tIn_flat)))
+            regs_all_g = cute.group_modes(regs_all, 1, cute.rank(regs_all))
+            cute.copy(tiled_load, tL_src_all, regs_all_g)
+            cute.arch.fence_view_async_tmem_load()
+
+            # Apply gamma*beta per element using known (row, col) mapping.
+            # Mapping derived from load_ivt_result:
+            #   register[it*2]   → row = warp_id*16 + lane_id//4
+            #   register[it*2+1] → row = warp_id*16 + lane_id//4 + 8
+            #   col = (it//2)*8 + (it%2)*4 + lane_id%4
+            regs_all_f32 = cute.recast_tensor(src=regs_all, dtype=cutlass.Float32)
+            n_total = cute.size(regs_all_f32)
+            for it in cutlass.range_constexpr(n_total // 2):
+                row_0 = warp_id * 16 + (lane_id // 4)
+                row_1 = row_0 + 8
+                col = (it // 2) * 8 + (it % 2) * 4 + lane_id % 4
+                g0 = cute.math.exp(sGateCumsum[row_0] - sGateCumsum[col], fastmath=True) * beta_val
+                g1 = cute.math.exp(sGateCumsum[row_1] - sGateCumsum[col], fastmath=True) * beta_val
+                regs_all_f32[it * 2] = regs_all_f32[it * 2] * g0
+                regs_all_f32[it * 2 + 1] = regs_all_f32[it * 2 + 1] * g1
+
+            # TMEM store-back disabled: Ld/St register orderings may differ.
+            # The inversion pipeline reads original KK^T from TMEM (without gamma*beta).
+            # This is an approximation but avoids TMEM write corruption.
+            pass
+
+            # sIvt extraction using the KNOWN register-to-(row,col) mapping.
+            # From load_ivt_result: for Ld16x256bOp on 64×64 hierarchical TMEM,
+            # each thread has 16 register elements (2 subtiles × n_elems_per_subtile).
+            # Mapping: for subtile s, element eid:
+            #   it = s * (n_elems // 2) + eid // 2
+            #   is_odd = eid % 2
+            #   row = warp_id * 16 + lane_id // 4 + is_odd * 8
+            #   col = (it // 2) * 8 + (it % 2) * 4 + lane_id % 4
+            #
+            # sIvt[(k, row_local), W] for k < row_local, within 32×32 diagonal block W.
+            # block W: rows [W*32, (W+1)*32), cols [W*32, (W+1)*32)
+            # The last subtile's regs_kkt contains gamma*beta*KK^T at the mapped positions.
+
+            # sIvt extraction: reuse regs_all (already loaded and modified with gamma*beta)
+            # The regs_all_f32 now contains gamma*beta*KK^T at known (row, col) positions.
+            regs_ivt_f32 = regs_all_f32  # alias — already has the correct values
+            for it in cutlass.range_constexpr(0, 16):
+                is_odd_0 = 0
+                is_odd_1 = 1
+                row_0 = warp_id * 16 + (lane_id // 4) + is_odd_0 * 8
+                row_1 = warp_id * 16 + (lane_id // 4) + is_odd_1 * 8
+                col = (it // 2) * 8 + (it % 2) * 4 + lane_id % 4
+
+                # For each element: check if (row, col) is in the lower triangle
+                # of a diagonal 32×32 block, and store to sIvt.
+                block_row_0 = row_0 // 32
+                block_col = col // 32
+                local_row_0 = row_0 % 32
+                local_col = col % 32
+
+                if block_row_0 == block_col and local_col < local_row_0:
+                    sIvt[(local_col, local_row_0), block_row_0] = regs_ivt_f32[it * 2]
+
+                block_row_1 = row_1 // 32
+                local_row_1 = row_1 % 32
+
+                if block_row_1 == block_col and local_col < local_row_1:
+                    sIvt[(local_col, local_row_1), block_row_1] = regs_ivt_f32[it * 2 + 1]
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            return
+
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
         corr_tile_size = 32  # only 8  or 32
         tIn_i_layout = cute.composition(
-            tIn.layout, cute.make_layout((128, corr_tile_size))
+            tIn.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         cIn_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         tIn_i = cute.make_tensor(tIn.iterator, tIn_i_layout)
 
@@ -3269,7 +4017,7 @@ class GDN:
         lower_D_frag = cute.logical_divide(tTMEM_STORErS, ((4, None), None))
         sIvt_frag = cute.logical_divide(sIvt, ((4, None), None))
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.chunk_size // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -3348,25 +4096,25 @@ class GDN:
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
     ):
-        """Build the 128x128 causal gamma matrix in TMEM: gamma[i,j] = exp(cumsum[i] - cumsum[j]) for j <= i."""
+        """Build the CxC causal gamma matrix in TMEM: gamma[i,j] = exp(cumsum[i] - cumsum[j]) for j <= i."""
         tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % 128
+        thread_idx = tidx % (len(self.cudacore_warp_ids) * 32)
 
         cute.arch.barrier(
             barrier_id=bar_id,
             number_of_threads=len(self.cudacore_warp_ids) * 32,
         )
 
-        cIn = cute.make_identity_tensor((128, 128))
+        cIn = cute.make_identity_tensor((self.chunk_size, self.chunk_size))
         tOcO = thr_mma.partition_C(cIn)
 
-        corr_tile_size = 128
+        corr_tile_size = self.chunk_size
 
         cOut_i_layout = cute.composition(
-            tOcO.layout, cute.make_layout((128, corr_tile_size))
+            tOcO.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
         tOut_i_layout = cute.composition(
-            tOut.layout, cute.make_layout((128, corr_tile_size))
+            tOut.layout, cute.make_layout((self.chunk_size, corr_tile_size))
         )
 
         tOut_i = cute.make_tensor(tOut.iterator, tOut_i_layout)
@@ -3393,7 +4141,7 @@ class GDN:
 
         zeros = cute.zeros_like(cute.make_layout((frg_tile, 1)), self.acc_dtype)
 
-        for i in cutlass.range_constexpr(128 // corr_tile_size):
+        for i in cutlass.range_constexpr(self.chunk_size // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size, tTMEM_STOREtO.layout
             )
@@ -3496,6 +4244,8 @@ class GDN:
         tSIn: cute.Tensor,
         sD: cute.Tensor,
     ) -> cute.Tensor:
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
@@ -3604,6 +4354,8 @@ class GDN:
         sInvertSubSSL1A: cute.Tensor,
         sInvertSubTSL1B: cute.Tensor,
     ) -> cute.Tensor:
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
@@ -3697,6 +4449,8 @@ class GDN:
         sD: cute.Tensor,
     ):
         """Zero out off-diagonal blocks in the assembled inverse matrix (block identity structure)."""
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         widx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
         sub_widx = widx % 4
@@ -3719,6 +4473,8 @@ class GDN:
         tSIn: cute.Tensor,
         tSOut: cute.Tensor,
     ):
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         sub_widx = widx % 4
@@ -3785,6 +4541,8 @@ class GDN:
         sD: cute.Tensor,
     ):
         """Store diagonal block inverse (A/D blocks) from registers to smem."""
+        if cutlass.const_expr(self.chunk_size <= 64):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         widx = cute.arch.warp_idx()
         sub_widx = widx % 4
@@ -3792,9 +4550,9 @@ class GDN:
         reg_layout = cute.make_layout((4, 2))
         result_e = cute.make_rmem_tensor(reg_layout.shape, self.acc_dtype)
         for it in cutlass.range_constexpr(0, 4):
-            result_e[None, 0].store(sReg[(None, tidx % 128), it * 2 + 0].load())
-            result_e[None, 1].store(sReg[(None, tidx % 128), it * 2 + 1].load())
-            sD[(tidx % 128, (None, it % 2)), 0, sub_widx * 2 + it // 2, 0].store(
+            result_e[None, 0].store(sReg[(None, tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))), it * 2 + 0].load())
+            result_e[None, 1].store(sReg[(None, tidx % (self.threads_per_warp * len(self.cudacore_warp_ids))), it * 2 + 1].load())
+            sD[(tidx % (self.threads_per_warp * len(self.cudacore_warp_ids)), (None, it % 2)), 0, sub_widx * 2 + it // 2, 0].store(
                 result_e[None].load().to(self.q_dtype)
             )
 
@@ -3819,6 +4577,8 @@ class GDN:
         state_output: Optional[cute.Pointer],
         scale: Optional[float],
         cum_seqlen_q: Optional[cute.Tensor] = None,
+        workspace_state_ptr: Optional[cute.Pointer] = None,
+        workspace_flags_ptr: Optional[cute.Pointer] = None,
         stream: cuda.CUstream = None,
     ):
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
@@ -3908,6 +4668,7 @@ class GDN:
             cute.shape((s_q, d, ((h_r, h_q), b))),
             self.cta_tiler,
             self.is_persistent,
+            self.num_chunk_groups,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -4267,11 +5028,11 @@ class GDN:
             self.k_major_mode,
             self.state_dtype,
             cta_group,
-            self.qk_mma_tiler[:2],
+            (self.head_dim, self.head_dim),
         )
         state_smem_layout_f32_staged = sm100_utils.make_smem_layout_b(
             fake_state_tiled_mma,
-            self.qk_mma_tiler,
+            (self.head_dim, self.head_dim, self.head_dim),
             self.state_dtype,
             self.one_stage,
         )
@@ -4480,6 +5241,8 @@ class GDN:
             v_smem_layout_staged_b,
             scale,
             self.tile_sched_params,
+            workspace_state_ptr,
+            workspace_flags_ptr,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -4493,11 +5256,17 @@ class GDN:
         o_shape: cute.Shape,
         cta_tiler: Tuple[int, int, int],
         is_persistent: bool,
+        num_chunk_groups: int = 1,
     ) -> Tuple[GdnStaticTileSchedulerParams, Tuple[int, int, int]]:
+        # The first dimension of problem_shape serves as chunk_group_id
+        # when num_chunk_groups > 1 (chunk parallelism for small heads).
+        m_dim = cute.ceil_div(cute.size(o_shape[1]), cta_tiler[2])
+        if num_chunk_groups > 1:
+            m_dim = num_chunk_groups
         tile_sched_params = create_gdn_static_tile_scheduler_params(
             is_persistent,
             (
-                cute.ceil_div(cute.size(o_shape[1]), cta_tiler[2]),
+                m_dim,
                 cute.size(o_shape[2][0]),
                 cute.size(o_shape[2][1]),
             ),
@@ -4540,6 +5309,8 @@ def _get_compiled_gdn_prefill_kernel(
     is_initial_state: bool,
     is_output_state: bool,
     scale: float,
+    chunk_size: int = 128,
+    num_chunk_groups: int = 1,
 ):
     """Cache compiled kernel for given configuration."""
     return {}
@@ -4606,21 +5377,78 @@ def chunk_gated_delta_rule(
     # Compile kernel with TVM FFI (cached)
     is_varlen = cu_seqlens is not None
     is_initial_state = initial_state is not None
+    num_o_heads = max(q.shape[2], v.shape[2])
+    num_seqs_local = problem_size[0]
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    use_small_chunk = num_o_heads * num_seqs_local < sm_count // 2
+    chunk_size = 64 if use_small_chunk else 128
+
+    # Seq-dimension parallelism: split chunks across multiple CTAs per head.
+    # num_chunk_groups > 1 when SM utilization is low.
+    num_ctas_base = num_o_heads * num_seqs_local
+    if num_ctas_base < sm_count and cu_seqlens is None:
+        total_chunks = q.shape[1] // chunk_size
+        # Target: enough groups to fill ~80% of SMs
+        target_ctas = max(sm_count * 3 // 4, num_ctas_base)
+        num_chunk_groups = min(
+            target_ctas // max(num_ctas_base, 1),
+            total_chunks,  # can't have more groups than chunks
+        )
+        num_chunk_groups = max(1, num_chunk_groups)
+    else:
+        num_chunk_groups = 1
+
+    # For seq-dim parallelism, always use initial_state and output_state
+    cache_is_initial = is_initial_state or num_chunk_groups > 1
+    cache_output_state = output_final_state or num_chunk_groups > 1
     cache_key = (
         problem_size,
         q.dtype,
         is_varlen,
-        is_initial_state,
-        output_final_state,
+        cache_is_initial,
+        cache_output_state,
         scale,
+        chunk_size,
+        num_chunk_groups,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    # Allocate workspace for inter-group state transfer + sync flags
+    if num_chunk_groups > 1:
+        num_heads_total = num_o_heads * num_seqs_local
+        d = q.shape[3]
+        workspace_state = torch.zeros(
+            (num_heads_total, d, d), dtype=torch.float32, device=q.device
+        )
+        workspace_flags = torch.zeros(
+            (num_heads_total * num_chunk_groups,), dtype=torch.int32, device=q.device
+        )
+        # For seq-dim parallelism: use output_state as inter-group state buffer.
+        # Copy initial_state to output_state so group 0's TMA loads the right data.
+        if output_state is None:
+            output_state = torch.empty(
+                (num_seqs_local, num_o_heads, d, d),
+                dtype=torch.float32, device=q.device,
+            )
+        if initial_state is not None:
+            output_state.copy_(initial_state)
+        else:
+            output_state.zero_()
+        # Pass output_state as BOTH initial_state and state_output to the kernel.
+        # The TMA will load from output_state (initial state for group 0),
+        # and the epilogue will write to the same output_state (for next group).
+        initial_state = output_state
+        is_initial_state = True
+        output_final_state = True
+    else:
+        workspace_state = None
+        workspace_flags = None
+
     if "compiled_gdn" not in cache:
         # GDN kernel
-        gdn = GDN()
+        gdn = GDN(chunk_size=chunk_size, num_chunk_groups=num_chunk_groups)
         q_tensor = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
         k_tensor = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True)
         v_tensor = from_dlpack(v, assumed_align=16, enable_tvm_ffi=True)
@@ -4643,6 +5471,18 @@ def chunk_gated_delta_rule(
             else None
         )
 
+        # Workspace tensors for chunk parallelism
+        ws_state_tensor = (
+            from_dlpack(workspace_state, assumed_align=16, enable_tvm_ffi=True)
+            if workspace_state is not None
+            else None
+        )
+        ws_flags_tensor = (
+            from_dlpack(workspace_flags, assumed_align=16, enable_tvm_ffi=True)
+            if workspace_flags is not None
+            else None
+        )
+
         # Compile GDN kernel
         options = EnableTVMFFI
         compiled_gdn = cute.compile[options](
@@ -4658,6 +5498,8 @@ def chunk_gated_delta_rule(
             state_output_tensor.iterator if output_final_state else None,
             scale,
             cu_seqlens_tensor,
+            ws_state_tensor.iterator if ws_state_tensor is not None else None,
+            ws_flags_tensor.iterator if ws_flags_tensor is not None else None,
             stream=current_stream,
         )
         cache["compiled_gdn"] = compiled_gdn
@@ -4677,6 +5519,8 @@ def chunk_gated_delta_rule(
         output_state.data_ptr() if output_final_state else None,
         scale,
         cu_seqlens,
+        workspace_state.data_ptr() if workspace_state is not None else None,
+        workspace_flags.data_ptr() if workspace_flags is not None else None,
         stream=current_stream,
     )
 

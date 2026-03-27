@@ -140,13 +140,15 @@ class GdnStaticTileScheduler:
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 10
-        new_params = cutlass.new_from_mlir_values(self._params, values[0:3])
+        # Flexible: params take first N values, rest split among other fields
+        n_params = len(cutlass.extract_mlir_values(self._params))
+        new_params = cutlass.new_from_mlir_values(self._params, values[0:n_params])
+        rest = values[n_params:]
         new_current_work_linear_idx = cutlass.new_from_mlir_values(
-            self._current_work_linear_idx, [values[3]]
+            self._current_work_linear_idx, [rest[0]]
         )
-        new_blk_coord = cutlass.new_from_mlir_values(self._blk_coord, values[4:7])
-        new_grid_shape = cutlass.new_from_mlir_values(self._grid_shape, values[7:])
+        new_blk_coord = cutlass.new_from_mlir_values(self._blk_coord, rest[1:4])
+        new_grid_shape = cutlass.new_from_mlir_values(self._grid_shape, rest[4:])
         return GdnStaticTileScheduler(
             new_params,
             new_current_work_linear_idx,
