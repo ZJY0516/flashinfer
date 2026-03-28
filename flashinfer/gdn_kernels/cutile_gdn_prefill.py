@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd as triton_l2norm_fwd
+    from fla.modules.l2norm import l2norm_fwd as triton_l2norm_fwd
 except ImportError:
     triton_l2norm_fwd = None
 
@@ -216,21 +216,25 @@ def _init_cache(B, T, H, K, V, device, dtype_k, dtype_v):
     }
 
 
-def _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, w_out, u_out):
+def _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, w_out, u_out,
+                           cu_seqlens=None, chunk_indices=None):
     """Cached WY recompute using .run() for lower Python overhead."""
     import triton
-    from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd_kernel
+    from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd_kernel
     B, T, H, K = k.shape
     V = v.shape[-1]
     BT = A_inv.shape[-1]
+    if chunk_indices is not None:
+        NT = chunk_indices.shape[0]
+    else:
+        NT = triton.cdiv(T, BT)
     recompute_w_u_fwd_kernel.run(
         k, v, beta, w_out, u_out, A_inv, g_cumsum,
-        None, None,
-        T, H, k.shape[-2], K, V, BT, 64, 64,
-        False,
-        grid=(triton.cdiv(T, BT), B * H),
+        cu_seqlens, chunk_indices,
+        T, H, K, V, BT, 64, 64,  # T, H, K, V, BT, BK, BV
+        USE_EXP2=False,
+        grid=(NT, B * H),
         warmup=False,
-        num_warps=8, num_stages=4,
     )
     return w_out, u_out
 
@@ -252,15 +256,42 @@ def chunk_gated_delta_rule_cutile(
     cu_seqlens: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """cuTile implementation of chunk_gated_delta_rule for GDN prefill."""
+    """cuTile implementation of chunk_gated_delta_rule for GDN prefill.
+
+    Supports both batched [B, T, H, K] and varlen [1, total_T, H, K] formats.
+    For varlen, pass cu_seqlens with all values multiples of BT=64.
+    """
     global _cached_stream
     B = q.shape[0]
     T = q.shape[1]
     H = q.shape[2]
     K = q.shape[3]
     V = v.shape[3]
-    BH = B * H
-    NT = (T + 63) >> 6  # T // 64, BT=64 always
+    BT = 64
+
+    IS_VARLEN = cu_seqlens is not None
+    if IS_VARLEN:
+        assert B == 1, f"B must be 1 for varlen, got {B}"
+        N = cu_seqlens.shape[0] - 1
+        # Validate BT-alignment
+        assert cu_seqlens[-1].item() % BT == 0, \
+            f"total_T (cu_seqlens[-1]={cu_seqlens[-1].item()}) must be a multiple of BT={BT}"
+        NH = N * H  # grid dim for sequential kernels
+        # Compute chunk_offsets and chunk_indices
+        chunk_offsets = (cu_seqlens // BT).to(torch.int32)
+        from fla.ops.utils.index import prepare_chunk_indices
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        # Default initial_state_indices for varlen
+        if initial_state_indices is None and initial_state is not None:
+            initial_state_indices = torch.arange(N, dtype=torch.int32, device=q.device)
+    else:
+        N = B
+        NH = B * H
+        chunk_offsets = None
+        chunk_indices = None
+
+    BH = B * H  # grid dim for per-chunk kernels (= H when B=1 varlen)
+    NT = (T + 63) >> 6  # total chunks
 
     if scale is None:
         scale = K ** -0.5
@@ -274,7 +305,6 @@ def chunk_gated_delta_rule_cutile(
         _cached_stream = torch.cuda.current_stream()
     stream = _cached_stream
     BK = 64 if K >= 64 else K
-    total_blocks = NT * BH
     USE_INITIAL = initial_state is not None
 
     # Pre-allocated intermediates
@@ -293,36 +323,41 @@ def chunk_gated_delta_rule_cutile(
     def _dispatch_output():
         out_BV = min(128, V)
         ct.launch(stream, (NT, BH), cutile_output_qcached_occ2_kernel,
-                  (q, k, v_new, h, g_cumsum, o, scale, T, H, K, V, 64, 64, out_BV))
+                  (q, k, v_new, h, g_cumsum, o, scale, T, H, K, V, BT, 64, out_BV))
 
-    # Adaptive BV: tune CTA count for rec throughput on B200 (148 SMs, occ2 = 296 cap)
+    # Adaptive BV: use NH for sequential kernel CTA count
     rec_BV = 8
-    max_rec_CTAs = (256 if V <= 128 else 512) if BH >= 64 else (64 if (BH <= 4 and NT > 32) else (128 if BH <= 8 else 256))
-    while (V + rec_BV - 1) // rec_BV * BH > max_rec_CTAs and rec_BV < 64:
+    max_rec_CTAs = (256 if V <= 128 else 512) if NH >= 64 else (64 if (NH <= 4 and NT > 32) else (128 if NH <= 8 else 256))
+    while (V + rec_BV - 1) // rec_BV * NH > max_rec_CTAs and rec_BV < 64:
         rec_BV *= 2
     n_v = (V + rec_BV - 1) // rec_BV
 
     ct.launch(stream, (NT, BH), ckkt_kernel,
-              (g, k, beta, g_cumsum, A_inv, T, H, K, 64, BK))
+              (g, k, beta, g_cumsum, A_inv, T, H, K, BT, BK))
+
+    # Dummy chunk_offsets for non-varlen (ct.launch can't accept None tensors)
+    _offsets = chunk_offsets if IS_VARLEN else torch.empty(1, dtype=torch.int32, device=q.device)
 
     # For fused path: if BV>32 but BV=32 with more CTAs is possible, prefer that
     fused_BV = rec_BV
     fused_n_v = n_v
-    if K <= 128 and BH >= 64 and rec_BV > 32 and V <= 128:
+    if K <= 128 and NH >= 64 and rec_BV > 32 and V <= 128:
         fused_BV = 32
         fused_n_v = (V + 31) // 32
-    use_fused = K <= 128 and BH >= 64 and fused_BV <= 32 and NT * BH >= 512
+    use_fused = K <= 128 and NH >= 64 and fused_BV <= 32 and NT * BH >= 512
     if use_fused:
         # Fused WY+rec: w, u computed on-the-fly per chunk, never in HBM.
-        # Saves w+u write+read bandwidth (~128MB for large configs at 8TB/s = ~16us).
-        ct.launch(stream, (fused_n_v, BH), cutile_fused_wy_rec_kernel,
+        ct.launch(stream, (fused_n_v, NH), cutile_fused_wy_rec_kernel,
                   (k, v, beta, g_cumsum, A_inv, h, v_new,
-                   initial_state, initial_state_indices, T, H, K, V, 64, fused_BV, NT, USE_INITIAL))
+                   initial_state, initial_state_indices, _offsets,
+                   T, H, K, V, BT, fused_BV, NT, USE_INITIAL, IS_VARLEN))
     else:
-        _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, c['w'], c['u'])
-        ct.launch(stream, (n_v, BH), cutile_recurrence_kernel_bv16,
+        _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, c['w'], c['u'],
+                               cu_seqlens, chunk_indices)
+        ct.launch(stream, (n_v, NH), cutile_recurrence_kernel_bv16,
                   (k, c['w'], c['u'], g_cumsum, h, v_new,
-                   initial_state, initial_state_indices, T, H, K, V, 64, rec_BV, NT, USE_INITIAL))
+                   initial_state, initial_state_indices, _offsets,
+                   T, H, K, V, BT, rec_BV, NT, USE_INITIAL, IS_VARLEN))
     _dispatch_output()
 
     return o, None, h
@@ -346,7 +381,8 @@ def _recurrence_kernel_bv16_body(
     h,              # [B, NT, H, K, V] output hidden states
     v_new,          # [B, T, H, V] output v_new
     initial_state,  # [N, H, K, V]
-    initial_state_indices,  # [B] int32
+    initial_state_indices,  # [B] or [N] int32
+    chunk_offsets,   # [N+1] int32 (varlen) or dummy (non-varlen)
     T: ConstInt,
     H: ConstInt,
     K: ConstInt,
@@ -355,6 +391,7 @@ def _recurrence_kernel_bv16_body(
     BV: ConstInt,    # block size for V dimension (16)
     NT: ConstInt,
     USE_INITIAL_STATE: ConstBool,
+    IS_VARLEN: ConstBool,
 ):
     """BV=16 recurrence for more CTA parallelism on small grids."""
     i_v = ct.bid(0)
@@ -362,6 +399,16 @@ def _recurrence_kernel_bv16_body(
     i_n = i_nh // H
     i_h = i_nh % H
     BK = 64
+    # For varlen: data is [1, total_T, H, ...], batch index is always 0
+    # For batched: data is [B, T, H, ...], batch index is i_n
+    if IS_VARLEN:
+        i_b = 0
+        t_start = ct.load(chunk_offsets, index=(i_n,), shape=()).astype(ct.int32)
+        t_end = ct.load(chunk_offsets, index=(i_n + 1,), shape=()).astype(ct.int32)
+    else:
+        i_b = i_n
+        t_start = 0
+        t_end = NT
     b_h1 = ct.zeros((BK, BV), dtype=ct.float32)
     b_h2 = ct.zeros((BK, BV), dtype=ct.float32)
     b_h3 = ct.zeros((BK, BV), dtype=ct.float32)
@@ -375,30 +422,30 @@ def _recurrence_kernel_bv16_body(
             b_h3 = b_h3 + ct.load(initial_state, index=(idx, i_h, 2, i_v), shape=(1, 1, BK, BV), padding_mode=PAD_ZERO).reshape((BK, BV)).astype(ct.float32)
         if K > 192:
             b_h4 = b_h4 + ct.load(initial_state, index=(idx, i_h, 3, i_v), shape=(1, 1, BK, BV), padding_mode=PAD_ZERO).reshape((BK, BV)).astype(ct.float32)
-    for i_t in range(NT):
-        ct.store(h, index=(i_n, i_t, i_h, 0, i_v), tile=b_h1.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+    for i_t in range(t_start, t_end):
+        ct.store(h, index=(i_b, i_t, i_h, 0, i_v), tile=b_h1.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
         if K > 64:
-            ct.store(h, index=(i_n, i_t, i_h, 1, i_v), tile=b_h2.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+            ct.store(h, index=(i_b, i_t, i_h, 1, i_v), tile=b_h2.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
         if K > 128:
-            ct.store(h, index=(i_n, i_t, i_h, 2, i_v), tile=b_h3.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+            ct.store(h, index=(i_b, i_t, i_h, 2, i_v), tile=b_h3.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
         if K > 192:
-            ct.store(h, index=(i_n, i_t, i_h, 3, i_v), tile=b_h4.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
-        w1 = ct.load(w, index=(i_n, i_t, i_h, 0), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            ct.store(h, index=(i_b, i_t, i_h, 3, i_v), tile=b_h4.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+        w1 = ct.load(w, index=(i_b, i_t, i_h, 0), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
         b_v = ct.zeros((BT, BV), dtype=ct.float32)
         b_v = ct.mma(w1, b_h1.astype(w1.dtype), b_v)
         if K > 64:
-            w2 = ct.load(w, index=(i_n, i_t, i_h, 1), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            w2 = ct.load(w, index=(i_b, i_t, i_h, 1), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             b_v = ct.mma(w2, b_h2.astype(w2.dtype), b_v)
         if K > 128:
-            w3 = ct.load(w, index=(i_n, i_t, i_h, 2), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            w3 = ct.load(w, index=(i_b, i_t, i_h, 2), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             b_v = ct.mma(w3, b_h3.astype(w3.dtype), b_v)
         if K > 192:
-            w4 = ct.load(w, index=(i_n, i_t, i_h, 3), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            w4 = ct.load(w, index=(i_b, i_t, i_h, 3), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             b_v = ct.mma(w4, b_h4.astype(w4.dtype), b_v)
-        u_tile = ct.load(u, index=(i_n, i_t, i_h, i_v), shape=(1, BT, 1, BV), padding_mode=PAD_ZERO).reshape((BT, BV))
+        u_tile = ct.load(u, index=(i_b, i_t, i_h, i_v), shape=(1, BT, 1, BV), padding_mode=PAD_ZERO).reshape((BT, BV))
         b_v_new = u_tile.astype(ct.float32) - b_v
-        ct.store(v_new, index=(i_n, i_t, i_h, i_v), tile=b_v_new.astype(v_new.dtype).reshape((1, BT, 1, BV)))
-        b_g = ct.load(g_cumsum, index=(i_n, i_t, i_h), shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
+        ct.store(v_new, index=(i_b, i_t, i_h, i_v), tile=b_v_new.astype(v_new.dtype).reshape((1, BT, 1, BV)))
+        b_g = ct.load(g_cumsum, index=(i_b, i_t, i_h), shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
         b_g_last = ct.extract(b_g, index=(BT - 1,), shape=(1,))
         g_diff = b_g_last - b_g
         g_diff = ct.minimum(g_diff, 20.0)
@@ -411,16 +458,16 @@ def _recurrence_kernel_bv16_body(
             b_h3 = b_h3 * b_g_last_exp
         if K > 192:
             b_h4 = b_h4 * b_g_last_exp
-        k1 = ct.load(k, index=(i_n, i_t, i_h, 0), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+        k1 = ct.load(k, index=(i_b, i_t, i_h, 0), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
         b_h1 = ct.mma(ct.transpose(k1), b_v_new_scaled, b_h1)
         if K > 64:
-            k2 = ct.load(k, index=(i_n, i_t, i_h, 1), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            k2 = ct.load(k, index=(i_b, i_t, i_h, 1), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             b_h2 = ct.mma(ct.transpose(k2), b_v_new_scaled, b_h2)
         if K > 128:
-            k3 = ct.load(k, index=(i_n, i_t, i_h, 2), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            k3 = ct.load(k, index=(i_b, i_t, i_h, 2), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             b_h3 = ct.mma(ct.transpose(k3), b_v_new_scaled, b_h3)
         if K > 192:
-            k4 = ct.load(k, index=(i_n, i_t, i_h, 3), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            k4 = ct.load(k, index=(i_b, i_t, i_h, 3), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             b_h4 = ct.mma(ct.transpose(k4), b_v_new_scaled, b_h4)
     idx = ct.load(initial_state_indices, index=(i_n,), shape=()).astype(ct.int32)
     ct.store(initial_state, index=(idx, i_h, 0, i_v), tile=b_h1.astype(initial_state.dtype).reshape((1, 1, BK, BV)))
@@ -453,7 +500,8 @@ def cutile_fused_wy_rec_kernel(
     h,              # [B, NT, H, K, V] output hidden states
     v_new,          # [B, T, H, V] output v_new
     initial_state,  # [N, H, K, V]
-    initial_state_indices,  # [B] int32
+    initial_state_indices,  # [B] or [N] int32
+    chunk_offsets,   # [N+1] int32 (varlen) or dummy (non-varlen)
     T: ConstInt,
     H: ConstInt,
     K: ConstInt,
@@ -462,6 +510,7 @@ def cutile_fused_wy_rec_kernel(
     BV: ConstInt,
     NT: ConstInt,
     USE_INITIAL_STATE: ConstBool,
+    IS_VARLEN: ConstBool,
 ):
     """Fused WY+rec: w and u computed on-the-fly per chunk, never written to HBM."""
     i_v = ct.bid(0)
@@ -469,6 +518,14 @@ def cutile_fused_wy_rec_kernel(
     i_n = i_nh // H
     i_h = i_nh % H
     BK = 64
+    if IS_VARLEN:
+        i_b = 0
+        t_start = ct.load(chunk_offsets, index=(i_n,), shape=()).astype(ct.int32)
+        t_end = ct.load(chunk_offsets, index=(i_n + 1,), shape=()).astype(ct.int32)
+    else:
+        i_b = i_n
+        t_start = 0
+        t_end = NT
     b_h1 = ct.zeros((BK, BV), dtype=ct.float32)
     b_h2 = ct.zeros((BK, BV), dtype=ct.float32)
     b_h3 = ct.zeros((BK, BV), dtype=ct.float32)
@@ -482,37 +539,37 @@ def cutile_fused_wy_rec_kernel(
             b_h3 = b_h3 + ct.load(initial_state, index=(idx, i_h, 2, i_v), shape=(1, 1, BK, BV), padding_mode=PAD_ZERO).reshape((BK, BV)).astype(ct.float32)
         if K > 192:
             b_h4 = b_h4 + ct.load(initial_state, index=(idx, i_h, 3, i_v), shape=(1, 1, BK, BV), padding_mode=PAD_ZERO).reshape((BK, BV)).astype(ct.float32)
-    for i_t in range(NT):
-        ct.store(h, index=(i_n, i_t, i_h, 0, i_v), tile=b_h1.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+    for i_t in range(t_start, t_end):
+        ct.store(h, index=(i_b, i_t, i_h, 0, i_v), tile=b_h1.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
         if K > 64:
-            ct.store(h, index=(i_n, i_t, i_h, 1, i_v), tile=b_h2.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+            ct.store(h, index=(i_b, i_t, i_h, 1, i_v), tile=b_h2.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
         if K > 128:
-            ct.store(h, index=(i_n, i_t, i_h, 2, i_v), tile=b_h3.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+            ct.store(h, index=(i_b, i_t, i_h, 2, i_v), tile=b_h3.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
         if K > 192:
-            ct.store(h, index=(i_n, i_t, i_h, 3, i_v), tile=b_h4.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
-        b_beta = ct.load(beta, index=(i_n, i_t, i_h), shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
-        b_g = ct.load(g_cumsum, index=(i_n, i_t, i_h), shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
+            ct.store(h, index=(i_b, i_t, i_h, 3, i_v), tile=b_h4.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+        b_beta = ct.load(beta, index=(i_b, i_t, i_h), shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
+        b_g = ct.load(g_cumsum, index=(i_b, i_t, i_h), shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
         b_exp_g = ct.exp(b_g)
-        v_tile = ct.load(v, index=(i_n, i_t, i_h, i_v), shape=(1, BT, 1, BV), padding_mode=PAD_ZERO).reshape((BT, BV))
+        v_tile = ct.load(v, index=(i_b, i_t, i_h, i_v), shape=(1, BT, 1, BV), padding_mode=PAD_ZERO).reshape((BT, BV))
         b_temp_f = v_tile.astype(ct.float32) * b_beta[:, None]
-        k1 = ct.load(k, index=(i_n, i_t, i_h, 0), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+        k1 = ct.load(k, index=(i_b, i_t, i_h, 0), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
         k1_scaled = (k1.astype(ct.float32) * b_beta[:, None] * b_exp_g[:, None]).astype(k1.dtype)
         b_temp_f = b_temp_f - ct.mma(k1_scaled, b_h1.astype(k1_scaled.dtype), ct.zeros((BT, BV), dtype=ct.float32))
         if K > 64:
-            k2 = ct.load(k, index=(i_n, i_t, i_h, 1), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            k2 = ct.load(k, index=(i_b, i_t, i_h, 1), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             k2_scaled = (k2.astype(ct.float32) * b_beta[:, None] * b_exp_g[:, None]).astype(k2.dtype)
             b_temp_f = b_temp_f - ct.mma(k2_scaled, b_h2.astype(k2_scaled.dtype), ct.zeros((BT, BV), dtype=ct.float32))
         if K > 128:
-            k3 = ct.load(k, index=(i_n, i_t, i_h, 2), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            k3 = ct.load(k, index=(i_b, i_t, i_h, 2), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             k3_scaled = (k3.astype(ct.float32) * b_beta[:, None] * b_exp_g[:, None]).astype(k3.dtype)
             b_temp_f = b_temp_f - ct.mma(k3_scaled, b_h3.astype(k3_scaled.dtype), ct.zeros((BT, BV), dtype=ct.float32))
         if K > 192:
-            k4 = ct.load(k, index=(i_n, i_t, i_h, 3), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            k4 = ct.load(k, index=(i_b, i_t, i_h, 3), shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
             k4_scaled = (k4.astype(ct.float32) * b_beta[:, None] * b_exp_g[:, None]).astype(k4.dtype)
             b_temp_f = b_temp_f - ct.mma(k4_scaled, b_h4.astype(k4_scaled.dtype), ct.zeros((BT, BV), dtype=ct.float32))
-        b_Ai = ct.load(A_inv, index=(i_n, i_t, i_h, 0), shape=(1, BT, 1, BT), padding_mode=PAD_ZERO).reshape((BT, BT))
+        b_Ai = ct.load(A_inv, index=(i_b, i_t, i_h, 0), shape=(1, BT, 1, BT), padding_mode=PAD_ZERO).reshape((BT, BT))
         b_v_new = ct.mma(b_Ai, b_temp_f.astype(b_Ai.dtype), ct.zeros((BT, BV), dtype=ct.float32))
-        ct.store(v_new, index=(i_n, i_t, i_h, i_v), tile=b_v_new.astype(v_new.dtype).reshape((1, BT, 1, BV)))
+        ct.store(v_new, index=(i_b, i_t, i_h, i_v), tile=b_v_new.astype(v_new.dtype).reshape((1, BT, 1, BV)))
         b_g_last = ct.extract(b_g, index=(BT - 1,), shape=(1,))
         g_diff = b_g_last - b_g
         g_diff = ct.minimum(g_diff, 20.0)

@@ -192,3 +192,104 @@ def test_cutile_vs_fla_accuracy(B, T, H, K, V, dtype, use_initial_state):
 def test_cutile_large_configs(B, T, H, K, V, dtype):
     """Accuracy on large Blackwell workloads (>1ms kernel time)."""
     _test_cutile_vs_fla(B, T, H, K, V, dtype, use_initial_state=True)
+
+
+# ---------------------------------------------------------------------------
+# Varlen (variable-length packed sequences) tests
+# ---------------------------------------------------------------------------
+
+from itertools import accumulate
+
+def _test_cutile_varlen_vs_fla(
+    seq_lens,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+    use_initial_state: bool = False,
+    seed: int = 42,
+):
+    """Compare cuTile varlen and FLA Triton varlen outputs."""
+    _skip_if_not_sm100()
+    _skip_if_cutile_unavailable()
+    _skip_if_fla_unavailable()
+
+    N = len(seq_lens)
+    for sl in seq_lens:
+        assert sl % 64 == 0, f"Sequence length {sl} is not a multiple of 64"
+    total_T = sum(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0] + list(accumulate(seq_lens)), dtype=torch.long, device="cuda"
+    )
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    device = torch.device("cuda")
+
+    # Packed tensors [1, total_T, H, K/V]
+    q = torch.randn(1, total_T, H, K, dtype=dtype, device=device)
+    k = torch.randn(1, total_T, H, K, dtype=dtype, device=device)
+    v = torch.randn(1, total_T, H, V, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(1, total_T, H, device=device, dtype=torch.float32))
+    beta = torch.sigmoid(torch.randn(1, total_T, H, device=device, dtype=torch.float32))
+    scale = K ** -0.5
+
+    q_n = F.normalize(q.float(), p=2, dim=-1).to(dtype)
+    k_n = F.normalize(k.float(), p=2, dim=-1).to(dtype)
+
+    if use_initial_state:
+        h0 = torch.randn(N, H, K, V, dtype=torch.float32, device=device)
+    else:
+        h0 = torch.zeros(N, H, K, V, dtype=torch.float32, device=device)
+    idx = torch.arange(N, dtype=torch.int32, device=device)
+
+    # ---- cuTile varlen ----
+    out_ct, _, _ = _ct_fwd(
+        q_n, k_n, v, g, beta, scale,
+        h0.clone(), idx,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+    )
+    torch.cuda.synchronize()
+
+    # ---- FLA Triton varlen ----
+    fla_h0 = h0.clone() if use_initial_state else None
+    ret_fla = _fla_fwd(
+        q_n, k_n, v, g, beta, scale,
+        initial_state=fla_h0,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+    )
+    out_fla = ret_fla[1] if isinstance(ret_fla, (tuple, list)) and len(ret_fla) >= 2 else ret_fla
+    torch.cuda.synchronize()
+
+    if dtype == torch.bfloat16:
+        atol, rtol = 1e-2, 1e-2
+    else:
+        atol, rtol = 1e-3, 1e-3
+
+    torch.testing.assert_close(
+        out_ct, out_fla, atol=atol, rtol=rtol,
+        msg=f"Varlen mismatch for seqs={seq_lens},H={H},K={K},V={V}",
+    )
+
+
+@pytest.mark.parametrize("use_initial_state", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("seq_lens,H,K,V", [
+    # Basic: same-length sequences
+    ([128, 128], 4, 128, 128),
+    ([64, 64, 64, 64], 4, 128, 128),
+    # Different lengths
+    ([64, 192], 4, 128, 128),
+    ([192, 64, 128], 4, 128, 128),
+    # Qwen3.5 scale (H=32)
+    ([256, 512, 256], 32, 128, 128),
+    ([64, 64, 64, 64], 32, 128, 128),
+    # Larger workloads
+    ([1024, 512, 256, 256], 32, 128, 128),
+    ([512, 512, 512, 512], 32, 128, 128),
+])
+def test_cutile_varlen_vs_fla(seq_lens, H, K, V, dtype, use_initial_state):
+    """cuTile varlen GDN prefill matches FLA Triton varlen baseline."""
+    _test_cutile_varlen_vs_fla(seq_lens, H, K, V, dtype, use_initial_state)

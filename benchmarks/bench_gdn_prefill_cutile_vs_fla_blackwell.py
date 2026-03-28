@@ -37,43 +37,9 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 
-# cuTile main entry point — import directly to avoid tvm_ffi dependency
-import importlib.util, sys, types, pathlib
-_kernel_path = pathlib.Path(__file__).parent.parent / "flashinfer/gdn_kernels/cutile_gdn_prefill.py"
-_SGLANG_ROOT = pathlib.Path("/home/scratch.xutingz_wwfo/gitsrc/sglang")
-# Bootstrap sglang FLA modules needed by cutile_gdn_prefill at runtime
-def _stub(name):
-    parts = name.split('.')
-    for i in range(1, len(parts) + 1):
-        pkg = '.'.join(parts[:i])
-        if pkg not in sys.modules:
-            m = types.ModuleType(pkg); m.__path__ = []; m.__package__ = pkg
-            sys.modules[pkg] = m
-def _load(name, path):
-    _stub(name)
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    mod.__package__ = name.rsplit('.', 1)[0]
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-import torch as _torch
-_stub("sglang.srt.utils.common")
-sys.modules["sglang.srt.utils.common"].torch_release = tuple(
-    int(x) for x in _torch.__version__.split(".")[:2] if x.isdigit()
-)
-_sgl_python = str(_SGLANG_ROOT / "python")
-if _sgl_python not in sys.path:
-    sys.path.insert(0, _sgl_python)
-_fla = _SGLANG_ROOT / "python/sglang/srt/layers/attention/fla"
-for _n in ["utils", "l2norm", "op", "index", "cumsum",
-           "chunk_scaled_dot_kkt", "solve_tril", "wy_fast", "chunk_delta_h", "chunk_o"]:
-    _load(f"sglang.srt.layers.attention.fla.{_n}", str(_fla / f"{_n}.py"))
+# cuTile main entry point
 try:
-    _spec = importlib.util.spec_from_file_location("cutile_gdn_prefill", _kernel_path)
-    _mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    ct_fwd = _mod.chunk_gated_delta_rule_cutile
+    from flashinfer.gdn_kernels.cutile_gdn_prefill import chunk_gated_delta_rule_cutile as ct_fwd
     CT_AVAILABLE = True
 except Exception as e:
     CT_AVAILABLE = False
@@ -116,6 +82,28 @@ CONFIGS_ALL = [
 ]
 
 CONFIGS_LARGE = [cfg for cfg in CONFIGS_ALL if cfg[0] * cfg[1] >= 4 * 2048]
+
+# Varlen configs: (seq_lens, H, K, V, label)
+VARLEN_CONFIGS = [
+    # --- Qwen3.5-4B TP8 (H=4) ---
+    ([2048],                    4, 128, 128, "1x2048  ,H=4"),
+    ([1024, 1024],              4, 128, 128, "2x1024  ,H=4"),
+    ([512, 512, 512, 512],      4, 128, 128, "4x512   ,H=4"),
+    ([256]*8,                   4, 128, 128, "8x256   ,H=4"),
+    ([2048, 1024, 512, 512],    4, 128, 128, "mixed4  ,H=4"),
+    ([4096],                    4, 128, 128, "1x4096  ,H=4"),
+    ([1024]*4,                  4, 128, 128, "4x1024  ,H=4"),
+    ([512]*8,                   4, 128, 128, "8x512   ,H=4"),
+    # --- Qwen3.5-397B TP8 (H=8) ---
+    ([2048],                    8, 128, 128, "1x2048  ,H=8"),
+    ([1024, 1024],              8, 128, 128, "2x1024  ,H=8"),
+    ([512, 512, 512, 512],      8, 128, 128, "4x512   ,H=8"),
+    ([256]*8,                   8, 128, 128, "8x256   ,H=8"),
+    ([2048, 1024, 512, 512],    8, 128, 128, "mixed4  ,H=8"),
+    ([4096],                    8, 128, 128, "1x4096  ,H=8"),
+    ([1024]*4,                  8, 128, 128, "4x1024  ,H=8"),
+    ([512]*8,                   8, 128, 128, "8x512   ,H=8"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +192,49 @@ def bench_config(B, T, H, K, V, label):
     return results
 
 
+def bench_varlen_config(seq_lens, H, K, V, label):
+    from itertools import accumulate
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    N = len(seq_lens)
+    total_T = sum(seq_lens)
+    cu_seqlens = torch.tensor([0] + list(accumulate(seq_lens)), dtype=torch.long, device=device)
+
+    q = torch.randn(1, total_T, H, K, dtype=dtype, device=device)
+    k = torch.randn(1, total_T, H, K, dtype=dtype, device=device)
+    v = torch.randn(1, total_T, H, V, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(1, total_T, H, device=device, dtype=torch.float32))
+    beta = torch.sigmoid(torch.randn(1, total_T, H, device=device, dtype=torch.float32))
+    h0 = torch.randn(N, H, K, V, dtype=torch.float32, device=device)
+    idx = torch.arange(N, dtype=torch.int32, device=device)
+    scale = K ** -0.5
+
+    q_n = F.normalize(q.float(), p=2, dim=-1).to(dtype)
+    k_n = F.normalize(k.float(), p=2, dim=-1).to(dtype)
+
+    results = {}
+
+    if CT_AVAILABLE:
+        fn_ct = lambda: ct_fwd(
+            q_n, k_n, v, g, beta, scale,
+            h0.clone(), idx,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+        )
+        results["ct_prof_us"] = _profiler_time_us(fn_ct)
+
+    if FLA_AVAILABLE:
+        fn_fla = lambda: fla_fwd(
+            q_n, k_n, v, g, beta, scale,
+            initial_state=h0.clone(),
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+        )
+        results["fla_prof_us"] = _profiler_time_us(fn_fla)
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark cuTile GDN prefill vs FLA Triton on Blackwell"
@@ -218,6 +249,16 @@ def main():
         action="store_true",
         help="Show per-kernel GPU time breakdown for cuTile",
     )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="Run varlen (packed variable-length) benchmarks instead of batched",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run both batched and varlen benchmarks",
+    )
     args = parser.parse_args()
 
     is_sm100 = _check_sm100()
@@ -225,8 +266,36 @@ def main():
     print(f"Device capability: SM{torch.cuda.get_device_capability()}")
     print()
 
+    run_batched = not args.varlen or args.all
+    run_varlen = args.varlen or args.all
+
+    if run_varlen:
+        print("=== Varlen (packed variable-length sequences) ===")
+        print()
+        print(f"{'Config':<18} {'FLA':>10} {'cuTile':>10} {'speedup':>10}")
+        print("-" * 52)
+        for seq_lens, H, K, V, label in VARLEN_CONFIGS:
+            r = bench_varlen_config(seq_lens, H, K, V, label)
+            ct_p = r.get("ct_prof_us", float("nan"))
+            fla_p = r.get("fla_prof_us", float("nan"))
+            spd = fla_p / ct_p if ct_p > 0 else float("nan")
+            print(
+                f"{label:<18}"
+                f" {fla_p/1000:>9.3f}ms"
+                f" {ct_p/1000:>9.3f}ms"
+                f" {spd:>9.2f}x"
+            )
+        print()
+
+    if not run_batched:
+        print("GPU kernel time only (torch.profiler CUDA events).")
+        return
+
     configs = CONFIGS_LARGE if args.large_only else CONFIGS_ALL
 
+    if run_varlen:
+        print("=== Batched (fixed-length) ===")
+        print()
     # Header
     print(f"{'Config':<18} {'FLA':>10} {'cuTile':>10} {'speedup':>10}")
     print("-" * 52)
